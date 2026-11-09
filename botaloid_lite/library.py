@@ -169,8 +169,9 @@ class Library:
         allowed = _matching(self._songs, author, title)
         if not allowed:
             return []
+        mask = allowed if (author or title) else None
         if groups:
-            quotes = self._quotes(self._candidates(groups, exclude), groups, phrases)
+            quotes = self._quotes(self._candidates(groups, exclude, mask), groups, phrases)
             quotes = [quote for quote in quotes if quote.song_id in allowed]
         elif author or title:
             quotes = self._openings(allowed, limit, phrases)
@@ -224,12 +225,16 @@ class Library:
         self._matrix = vectorizer.fit_transform(docs)
         return True
 
-    def _candidates(self, groups, exclude=()):
+    def _candidates(self, groups, exclude=(), allowed=None):
         if not groups or not self._ensure_index():
             return []
         with self._lock:
             vectors = self._vectorizer.transform([term for group in groups for term in group])
             scores = (vectors @ self._matrix.T).toarray()
+            if allowed is not None:
+                active = np.fromiter((line.song_id in allowed for line in self._lines),
+                                     dtype=bool, count=len(self._lines))
+                scores[:, ~active] = 0
         excluded = {normalized(text) for text in exclude}
         take = min(POOL, len(self._lines))
         pools, offset = [], 0
@@ -371,11 +376,11 @@ class Library:
         allowed = _matching(self._songs, plan.get("author"), plan.get("title"))
         if not allowed:
             return []
+        named = plan.get("author") or plan.get("title")
         if not groups:
-            return self._openings(allowed, settings.results, settings.phrases) \
-                if (plan.get("author") or plan.get("title")) else []
-        quotes = self._quotes(self._candidates(groups), groups, settings.phrases)
-        return [quote for quote in quotes if quote.song_id in allowed]
+            return self._openings(allowed, settings.results, settings.phrases) if named else []
+        return self._quotes(self._candidates(groups, allowed=allowed if named else None),
+                            groups, settings.phrases)
 
     def _select(self, quotes, turns, message, settings):
         if settings.model is None:
