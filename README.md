@@ -10,6 +10,8 @@
 - `step()` 接收聊天历史、返回新的聊天历史，调用两次模型：一次生成检索词，一次从候选里挑选。
   不传 `model` 时完全确定性，不调用任何模型。
 - 每条结果都带原文、译文、`start_ms` / `end_ms`、逐行时间、曲名、署名、曲内行号。
+- `botaloid_lite.media` 是独立的可选模块，把歌词元数据换成带起播时间的播放链接（先支持 VocaDB → YouTube），
+  不依赖检索、模型或 numpy。
 
 ```python
 from botaloid_lite import Library, Settings
@@ -39,6 +41,7 @@ print(history[-1]["fragments"])
   - [`step()`](#step)
   - [`Passage` 与 `LineSpan`](#passage-与-linespan)
   - [`Settings`](#settings)
+- [媒体链接](#媒体链接)
 - [接入模型：`call_model`](#接入模型call_model)
   - [签名与返回值](#签名与返回值)
   - [PLAN 阶段](#plan-阶段)
@@ -282,6 +285,87 @@ class Settings:
     phrases: int = 4                         # 每段最多几小句
 ```
 
+## 媒体链接
+
+`botaloid_lite.media` 把一段歌词元数据换成可以播放的链接。它不依赖 `Library`，
+也不依赖 numpy/scikit-learn，只用标准库；`Passage`、`Passage.to_dict()` 或任何带
+`title` / `author` / `start_ms` 的对象都能直接传进去。
+
+```python
+from botaloid_lite import Library
+from botaloid_lite.media import Resolver
+
+library = Library("data/lyrics.sqlite3")
+passage = library.search("夜里散步", limit=1)[0]
+
+link = Resolver().find(passage)
+print(link.url)             # https://www.youtube.com/watch?v=...&t=59
+print(link.start_seconds)   # 59
+```
+
+### 抽象层
+
+| 名称 | 作用 |
+| --- | --- |
+| `LyricMeta` | `title`、`author`、`start_ms`；`LyricMeta.coerce(...)` 接受映射、对象或字符串 |
+| `MediaLink` | `url`、`provider`、`service`、`start_seconds`、`video_id`、`title`，可 `to_dict()` |
+| `Querier` | 协议：`name` 加 `find(meta) -> MediaLink | None` |
+| `Resolver` | 按顺序尝试 querier，返回第一个结果；单个 provider 抛异常时跳过它 |
+| `register` / `available` | 注册、列出可用的 querier |
+| `resolve(meta, queriers=None)` | 一次性调用 |
+
+`Resolver()` 使用所有已注册的 querier；`Resolver(["vocadb"])` 按名字选择，
+`Resolver([MyQuerier()])` 直接传实例。名字不存在会抛 `ValueError`。
+
+新增一个服务只要实现 `find` 并注册：
+
+```python
+from botaloid_lite.media import MediaLink, register
+
+class BilibiliQuerier:
+    name = "bilibili"
+
+    def find(self, meta):
+        ...
+        return MediaLink(url="https://www.bilibili.com/video/BV...?t=59",
+                         provider="bilibili", service="bilibili",
+                         start_seconds=meta.start_seconds)
+
+register(BilibiliQuerier())
+```
+
+### VocaDB（YouTube）
+
+`VocadbQuerier` 用 [VocaDB 公共 API](https://wiki.vocadb.net/docs/public-api) 找到曲目，
+取其 YouTube PV，把 `start_ms` 向下取整成秒，拼成
+`https://www.youtube.com/watch?v=<video_id>&t=<seconds>`。
+没有 `start_ms` 时不加时间参数；没有可播放的 YouTube PV 时返回 `None`。
+
+匹配规则：
+
+- 先用去掉结尾括号（`(feat. …)`、`[Remix]` 等）的曲名搜索，没有结果再用完整曲名，最多两次请求。
+- `sort=FavoritedTimes` 让经典版本排在前面；候选取名与曲名的相似度、署名命中数、
+  是否 `Original` 综合打分，完全没有名字相似度的结果直接丢弃。
+- YouTube PV 优先 `pvType=Original`，其次发布更早的；跳过 `disabled` 的和非 YouTube 的 PV。
+- 响应按 URL 缓存（`cache_size`）；默认 10 条结果、`lang="Japanese"`，请求带自定义 User-Agent。
+  请遵守 VocaDB 的请求频率要求，不要高频调用。
+
+```python
+from botaloid_lite.media import VocadbQuerier
+
+querier = VocadbQuerier(max_results=10, cache_size=256, timeout=10)
+link = querier.find({"title": "千本桜", "author": "黒うさP / 初音ミク", "start_ms": 32500})
+print(link.url)   # https://www.youtube.com/watch?v=shs0rAiwsGQ&t=32
+```
+
+网络或响应错误会抛 `botaloid_lite.media.QuerierError`；通过 `Resolver` 调用时
+该 provider 会被跳过，不影响其他 querier。测试时可以传入自己的
+`fetch(url, timeout=...)`，不需要联网：
+
+```python
+VocadbQuerier(fetch=lambda url, timeout=15: {"items": []})
+```
+
 ## 接入模型：`call_model`
 
 `step()` 需要模型时调用 `settings.model`，一次用户消息最多两次。
@@ -499,7 +583,8 @@ passages = library.search(queries=[["夜道", "夜里散步"], ["街灯"]], limi
 ```
 
 测试覆盖：返回字段与逐行时间、作者 / 曲名过滤、四向导航、`exclude`、`refine`、
-确定性排序与两阶段 `step`、模型错误包装。
+确定性排序与两阶段 `step`、模型错误包装；媒体链接的元数据转换、VocaDB 匹配与
+PV 选择、URL 与时间戳、缓存、provider 选择与失败隔离。
 
 ## 数据与版权
 
