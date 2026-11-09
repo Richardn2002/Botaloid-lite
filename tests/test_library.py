@@ -3,7 +3,6 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock
 
 from botaloid_lite import Library, ModelError, Settings
 from botaloid_lite import prompts
@@ -113,36 +112,11 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual([item["title"] for item in seen], ["夜", "別"])
         self.assertEqual([hit.title for hit in hits], ["別"])
 
-    def test_step_continues_a_lyric_without_a_model(self):
-        def model(*_args):
-            raise AssertionError("the model must not be called")
+    def test_step_sends_a_lyric_through_both_stages(self):
+        called = []
 
-        history = [{"role": "user", "text": "君の声を聞かせて"}]
-        result = self.library.step(history, settings=Settings(model=model))
-        self.assertEqual(len(result), 2)
-        self.assertEqual(result[-1]["status"], "continued")
-        self.assertEqual(result[-1]["text"], "また明日")
-        self.assertEqual(result[-1]["fragments"][0]["start_ms"], 5000)
-        self.assertEqual(history, [{"role": "user", "text": "君の声を聞かせて"}])
-
-    def test_step_prefers_the_phrase_after_the_last_reply(self):
-        result = self.library.step([
-            {"role": "user", "text": "何か歌って"},
-            {"role": "assistant", "text": "静かな夜を歩いた",
-             "source": {"song_id": 1, "start": 0, "end": 0}},
-            {"role": "user", "text": "君の声を聞かせて"},
-        ])
-        self.assertEqual(result[-1]["fragments"][0]["text"], "また明日")
-
-    def test_step_reports_the_end_of_a_song(self):
-        result = self.library.step([
-            {"role": "assistant", "text": "また明日", "source": {"song_id": 1, "start": 2, "end": 2}},
-            {"role": "user", "text": "光が差す"},
-        ])
-        self.assertIn(result[-1]["status"], ("continued", "ended"))
-
-    def test_step_falls_back_to_the_model_when_the_lyric_is_ambiguous(self):
         def model(system, prompt, temperature, schema):
+            called.append(system)
             if system == prompts.PLAN:
                 return {"queries": [["静かな夜"]], "author": "", "title": ""}
             self.assertIn("候选", prompt)
@@ -150,15 +124,9 @@ class LibraryTests(unittest.TestCase):
 
         result = self.library.step([{"role": "user", "text": "同じ歌詞の行"}],
                                    settings=Settings(model=model))
+        self.assertEqual(called, [prompts.PLAN, prompts.SELECT])
         self.assertEqual(result[-1]["status"], "selected")
         self.assertEqual(len(result[-1]["fragments"]), 1)
-
-    def test_step_can_disable_continuation(self):
-        model = Mock(return_value={"queries": [["夜"]], "choices": [{"id": 1, "count": 1}]})
-        result = self.library.step([{"role": "user", "text": "また明日"}],
-                                   settings=Settings(model=model, allow_continue=False))
-        self.assertEqual(model.call_count, 2)
-        self.assertIn(result[-1]["status"], ("selected", "no_match"))
 
     def test_step_requires_a_final_user_turn(self):
         with self.assertRaises(ValueError):

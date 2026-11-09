@@ -7,8 +7,8 @@
 只有三个入口：构造 `Library`、`search()`、`step()`。
 
 - `search()` 纯检索，**从不调用模型**，约 0.1–0.2 秒。
-- `step()` 接收聊天历史、返回新的聊天历史；用户贴出整句歌词时**不调用模型**直接接下一句，
-  其余情况调用两次模型（一次生成检索词，一次从候选里挑选）。
+- `step()` 接收聊天历史、返回新的聊天历史，调用两次模型：一次生成检索词，一次从候选里挑选。
+  不传 `model` 时完全确定性，不调用任何模型。
 - 每条结果都带原文、译文、`start_ms` / `end_ms`、逐行时间、曲名、署名、曲内行号。
 
 ```python
@@ -48,7 +48,6 @@ print(history[-1]["fragments"])
   - [完整示例：Ollama](#完整示例ollama)
   - [不接模型](#不接模型)
   - [只做一次调用：`refine`](#只做一次调用refine)
-- [接龙行为](#接龙行为)
 - [设计要点与限制](#设计要点与限制)
 - [测试](#测试)
 - [数据与版权](#数据与版权)
@@ -187,7 +186,7 @@ step(history, *, settings=None) -> list[dict]
 {
   "role": "assistant",
   "text": "静かな夜を歩いた\n君の声を聞かせて",
-  "status": "selected",                     // continued / selected / no_match / ended
+  "status": "selected",                     // selected / no_match
   "source": {"song_id": 1, "start": 0, "end": 1},
   "fragments": [ /* Passage.to_dict()，见下文 */ ]
 }
@@ -195,13 +194,11 @@ step(history, *, settings=None) -> list[dict]
 
 | `status` | 含义 |
 | --- | --- |
-| `continued` | 用户贴的歌词被直接接上，未调用模型 |
 | `selected` | 模型（或确定性排序）从候选里选出了片段 |
 | `no_match` | 没有可用片段，`text` 为空、`fragments` 为空 |
-| `ended` | 已经唱到曲末，`text` 为空、`fragments` 为空 |
 
-助手回复里的 `source` 是最后一段的定位符；把整条助手回复原样放回 `history`，
-下一轮就能从这个位置继续接龙或前后跳转。`source` 视为不透明值，不要自己拼接。
+助手回复里的 `source` 是最后一段的定位符，可以交给 `search(source=..., direction=...)`
+取它的前文、后文或上下文；`source` 视为不透明值，不要自己拼接。
 
 ```python
 history = [{"role": "user", "text": "唱点写夜里散步的歌"}]
@@ -212,9 +209,8 @@ history = library.step(history + [{"role": "user", "text": "再来几句"}], set
 `step` 在以下顺序里做决定：
 
 1. `history` 非空且最后一条是用户消息，否则抛 `ValueError`。
-2. `allow_continue` 允许时，尝试**接龙**：见[接龙行为](#接龙行为)。
-3. 调用 PLAN 生成检索词（`model is None` 时跳过）。
-4. 检索候选；调用 SELECT 挑选（`model is None` 时直接取排序最前的 `results` 条）。
+2. 调用 PLAN 生成检索词（`model is None` 时跳过）。
+3. 检索候选；调用 SELECT 挑选（`model is None` 时直接取排序最前的 `results` 条）。
 
 ### `Passage` 与 `LineSpan`
 
@@ -284,14 +280,6 @@ class Settings:
     select_temperature: float = 0.55         # SELECT 阶段
     results: int = 3                         # 一次回复最多选几段
     phrases: int = 4                         # 每段最多几小句
-    allow_continue: bool | Callable = True   # 是否允许直接接龙；可传判断函数
-```
-
-`allow_continue` 传函数时接收整个 `history`（已复制），返回真假：
-
-```python
-# 用户问“这句什么意思”时不要接着唱，其余情况允许
-Settings(allow_continue=lambda history: "什么意思" not in history[-1]["text"])
 ```
 
 ## 接入模型：`call_model`
@@ -490,35 +478,11 @@ passages = library.search("夜里散步", refine=refine, limit=3)
 passages = library.search(queries=[["夜道", "夜里散步"], ["街灯"]], limit=3)
 ```
 
-## 接龙行为
-
-如果最新一条用户消息本身就是**整句歌词**，`step()` 直接返回下一句，不调用任何模型。
-
-判定条件：
-
-1. 规范化后（全半角、大小写、标点、空白不敏感）与曲库中的连续小句完全一致；
-2. 起点和终点都落在小句边界上，即不会截断半句；
-3. 长度至少 2 个字（上一轮回复带有 `source` 时）或 4 个字；
-4. 这句歌词在曲库里出现多次时，**每次后面的那句必须相同**，否则视为有歧义，退回模型挑选。
-
-上一轮回复的 `source` 就停在这句歌词之前时，直接取它后面一句（`status: "continued"`）。
-唱到最后一句时返回 `status: "ended"`。
-
-想关掉接龙，或者只在特定情况下接龙：
-
-```python
-Settings(allow_continue=False)
-Settings(allow_continue=lambda history: "唱" in history[-1]["text"])
-```
-
-注意“用户贴歌词是在接龙还是在讨论这句歌词”属于应用层的判断，模块只按上面的规则执行；
-需要区分时，用 `allow_continue` 传入自己的判断函数。
-
 ## 设计要点与限制
 
 - **模型只挑编号，不写歌词。** 两个阶段都只产出检索词和候选编号，歌词永远来自曲库。
 - **译文只参与检索。** 中文提问能命中日文原文，但返回的 `text` 一定是原文，`translation` 单独给出。
-- **短语边界是统一的单位。** 检索、合并、接龙、前后跳转都以小句为最小单位，
+- **短语边界是统一的单位。** 检索、合并和前后跳转都以小句为最小单位，
   跨行合并会修复“日文歌词在句中换行”的情况。
 - **曲库是快照。** 构造 `Library` 时读入歌词，重建曲库后要重新构造实例。
 - **只读。** 不会修改曲库文件，也不会写入任何配置。
@@ -535,7 +499,7 @@ Settings(allow_continue=lambda history: "唱" in history[-1]["text"])
 ```
 
 测试覆盖：返回字段与逐行时间、作者 / 曲名过滤、四向导航、`exclude`、`refine`、
-确定性与两阶段的 `step`、接龙与歧义回退、曲末、模型错误包装。
+确定性排序与两阶段 `step`、模型错误包装。
 
 ## 数据与版权
 

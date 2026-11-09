@@ -9,14 +9,13 @@ Public surface:
 
 `search` never calls a model.  `step` calls the model twice per user turn --
 once to turn the conversation into search terms, once to choose among the
-candidates those terms retrieved -- unless the message is a verbatim lyric
-passage, which is answered without any model call at all.
+candidates those terms retrieved.
 """
 
 import json
 import sqlite3
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from itertools import zip_longest
 from pathlib import Path
@@ -25,7 +24,7 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from .prompts import PLAN, PLAN_SCHEMA, SELECT, SELECT_SCHEMA
-from .text import Line, Track, continuation, normalized
+from .text import Line, Track, normalized
 
 Model = Callable[[str, str, float, dict], Mapping | str]
 DIRECTIONS = ("at", "before", "after", "around")
@@ -93,7 +92,7 @@ class Passage:
             "position": self.position,
             "start_ms": self.start_ms,
             "end_ms": self.end_ms,
-            # Opaque locator: pass it back as `source` to continue or navigate.
+            # Opaque locator: pass it back as `source` to navigate.
             "source": {"song_id": self.song_id, "start": self.start, "end": self.end},
             "lines": [line.to_dict() for line in self.lines],
         }
@@ -108,8 +107,6 @@ class Settings:
     select_temperature: float = 0.55
     results: int = 3
     phrases: int = 4
-    # False, or a predicate on the history, to disable lyric continuation.
-    allow_continue: bool | Callable[[Sequence[Mapping]], bool] = True
 
 
 class Library:
@@ -189,26 +186,17 @@ class Library:
         `history` is a list of {"role": "user"|"assistant", "text": str}
         dicts whose last turn is the user message being answered.  Assistant
         turns returned by this method also carry `fragments`, `source` and
-        `status`; pass them back unchanged so continuation and navigation work.
+        `status`; keep them so the caller can navigate with search(source=...).
         """
         settings = settings or Settings()
         turns = [dict(turn) for turn in history]
         if not turns or turns[-1].get("role") != "user":
             raise ValueError("history must end with a user turn")
         message = str(turns[-1].get("text") or "")
-        last = next((turn for turn in reversed(turns[:-1]) if turn.get("role") == "assistant"), None)
-        source = _source(last) if last else None
-        allow = settings.allow_continue
-        if callable(allow):
-            allow = bool(allow(turns))
-        if allow and message:
-            match = continuation(self._tracks, message, source)
-            if match:
-                return turns + [self._continued(match)]
         plan = self._plan(turns, message, settings)
         quotes = self._quotes_for_plan(plan, message, settings)
         selected = self._select(quotes, turns, message, settings) if quotes else []
-        return turns + [_turn(selected, "selected")]
+        return turns + [_turn(selected)]
 
     # --------------------------------------------------------------- internals
 
@@ -355,14 +343,6 @@ class Library:
         passage = self._passage(song_id, first, last)
         return [passage] if passage is not None else []
 
-    def _continued(self, match):
-        song_id, index = match
-        track = self._tracks[song_id]
-        if index >= len(track.phrases):
-            return {"role": "assistant", "text": "", "fragments": [],
-                    "source": None, "status": "ended"}
-        return _turn([self._passage(song_id, index, index)], "continued")
-
     def _plan(self, turns, message, settings):
         if settings.model is None:
             return {}
@@ -438,17 +418,6 @@ def _text(value):
     return value.strip()[:100] if isinstance(value, str) else ""
 
 
-def _source(turn):
-    source = turn.get("source") if isinstance(turn, Mapping) else None
-    if not isinstance(source, Mapping):
-        return None
-    try:
-        return {"song_id": int(source["song_id"]),
-                "start": int(source["start"]), "end": int(source["end"])}
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
 def _groups(queries, query):
     groups, seen = [], set()
     source = [queries] if isinstance(queries, str) else list(queries or [])
@@ -514,10 +483,10 @@ def _options(tracks, quotes):
     return result
 
 
-def _turn(passages, status):
+def _turn(passages):
     fragments = [passage.to_dict() for passage in passages]
     if not fragments:
         return {"role": "assistant", "text": "", "fragments": [],
                 "source": None, "status": "no_match"}
     return {"role": "assistant", "text": "\n".join(p.text for p in passages),
-            "fragments": fragments, "source": fragments[-1]["source"], "status": status}
+            "fragments": fragments, "source": fragments[-1]["source"], "status": "selected"}

@@ -1,14 +1,13 @@
-"""Normalisation, phrase segmentation and exact lyric matching.
+"""Normalisation and phrase segmentation.
 
 The library stores one row per lyric line.  A *phrase* is what a user would
 call "a line to quote": one sentence, or one clause, never a fragment that
-starts mid-word.  Retrieval, quoting and continuation all work on phrases,
-so those boundaries are the unit everything else agrees on.
+starts mid-word.  Retrieval, quoting and navigation all work on phrases, so
+those boundaries are the unit everything else agrees on.
 """
 
 import re
 import unicodedata
-from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import cached_property
@@ -63,10 +62,6 @@ class Track:
     lines: list[Line]
 
     @cached_property
-    def key(self):
-        return "".join(normalized(line.text) for line in self.lines)
-
-    @cached_property
     def phrases(self):
         result = []
         for line in self.lines:
@@ -87,37 +82,12 @@ class Track:
         return result
 
     @cached_property
-    def boundaries(self):
-        offsets = [0]
-        for phrase in self.phrases:
-            offsets.append(offsets[-1] + len(phrase.key))
-        return offsets
-
-    @cached_property
     def by_line(self):
         positions = defaultdict(list)
         for i, phrase in enumerate(self.phrases):
             for line in phrase.lines:
                 positions[line.id].append(i)
         return positions
-
-    def matches(self, key):
-        """Yield (first_phrase, next_phrase, aligned) for every occurrence of key."""
-        ends = self.boundaries
-        start = self.key.find(key)
-        while start >= 0:
-            stop = start + len(key)
-            boundary = bisect_left(ends, stop)
-            if boundary < len(ends) and ends[boundary] == stop:
-                first = bisect_right(ends, start) - 1
-                yield first, boundary, ends[first] == start
-            start = self.key.find(key, start + 1)
-
-    def locate(self, key):
-        start = self.key.find(key)
-        if start >= 0:
-            return bisect_right(self.boundaries, start) - 1, bisect_left(self.boundaries, start + len(key))
-        return None
 
 
 def split_line(text):
@@ -140,36 +110,3 @@ def split_line(text):
         elif rest and result:
             result[-1] += rest
     return [piece for piece in result if normalized(piece)]
-
-
-def continuation(tracks, message, source=None):
-    """The next phrase when `message` is a verbatim lyric passage.
-
-    Returns (song_id, phrase_index) or None.  The passage must be whole
-    phrases, and every occurrence of it in the library must be followed by
-    the same phrase -- otherwise the library cannot tell which song the user
-    meant and stays quiet.
-    """
-    key = normalized(message)
-    if len(key) < (2 if source else 4):
-        return None
-    source_song = source["song_id"] if source else None
-    hits = []
-    for song_id, track in tracks.items():
-        if len(key) < 4 and song_id != source_song:
-            continue
-        if key not in track.key:
-            continue
-        for first, end, aligned in track.matches(key):
-            if not aligned:
-                continue
-            following = track.phrases[end].key if end < len(track.phrases) else None
-            hits.append((song_id, first, end, following))
-    if not hits or len({hit[3] for hit in hits}) != 1:
-        return None
-    if source:
-        forward = [hit for hit in hits if hit[0] == source_song and hit[1] == source["end"] + 1]
-        if forward:
-            return forward[0][0], forward[0][2]
-    song_id, _, end, _ = max(hits, key=lambda hit: (hit[2] - hit[1], -hit[0]))
-    return song_id, end
