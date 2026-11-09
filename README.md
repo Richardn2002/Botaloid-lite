@@ -1,59 +1,138 @@
 # Botaloid-lite
 
-用曲库里的歌词原文来聊天：返回歌词、译文、在歌曲中的起止时间、曲名、署名和段内位置。
-没有设置页面、没有持久化配置、没有 Web 服务，只有三个入口：`init`、`search`、`step`。
+用曲库里的**歌词原文**来回复：返回歌词、译文、在歌曲中的起止时间、曲名、署名和段内位置。
+
+它是一个库，不是服务：没有配置持久化、没有 Web 界面、没有账号体系。
+所有设置随调用传入，所有结果都是一个普通的 `dict` 或 dataclass。
+只有三个入口：构造 `Library`、`search()`、`step()`。
+
+- `search()` 纯检索，**从不调用模型**，约 0.1–0.2 秒。
+- `step()` 接收聊天历史、返回新的聊天历史；用户贴出整句歌词时**不调用模型**直接接下一句，
+  其余情况调用两次模型（一次生成检索词，一次从候选里挑选）。
+- 每条结果都带原文、译文、`start_ms` / `end_ms`、逐行时间、曲名、署名、曲内行号。
 
 ```python
 from botaloid_lite import Library, Settings
 
 library = Library("data/lyrics.sqlite3")
 
-library.search("夜里散步", limit=3)          # 不调用模型，直接检索
-library.step(history, settings=Settings())   # 追加一条助手回复，返回新的 history
+for passage in library.search("夜里散步", limit=3):      # 不需要模型
+    print(passage.title, passage.author, passage.start_ms, passage.text)
+
+history = library.step([{"role": "user", "text": "唱点写夜里散步的歌"}],
+                       settings=Settings(model=call_model))
+print(history[-1]["fragments"])
 ```
+
+`call_model` 的写法见[接入模型](#接入模型call_model)；不想接模型时直接省略 `settings`。
+
+---
+
+## 目录
+
+- [安装](#安装)
+- [准备曲库](#准备曲库)
+- [曲库结构](#曲库结构)
+- [API](#api)
+  - [`Library(path)`](#librarypath)
+  - [`search()`](#search)
+  - [`step()`](#step)
+  - [`Passage` 与 `LineSpan`](#passage-与-linespan)
+  - [`Settings`](#settings)
+- [接入模型：`call_model`](#接入模型call_model)
+  - [签名与返回值](#签名与返回值)
+  - [PLAN 阶段](#plan-阶段)
+  - [SELECT 阶段](#select-阶段)
+  - [容错与错误](#容错与错误)
+  - [完整示例：OpenAI 兼容接口](#完整示例openai-兼容接口)
+  - [完整示例：Ollama](#完整示例ollama)
+  - [不接模型](#不接模型)
+  - [只做一次调用：`refine`](#只做一次调用refine)
+- [接龙行为](#接龙行为)
+- [设计要点与限制](#设计要点与限制)
+- [测试](#测试)
+- [数据与版权](#数据与版权)
+
+---
 
 ## 安装
 
-需要 Python 3.11+。
+需要 Python 3.11+ 和 numpy、scikit-learn。
 
 ```sh
 python -m venv .venv
 .venv/bin/python -m pip install -e .
 ```
 
-## 准备曲库
+Windows 下把 `.venv/bin/python` 换成 `.venv\Scripts\python`。
 
-两个脚本，先取原始数据，再整理成曲库：
+`tools/fetch_netease.py` 额外需要 `requests`：
 
 ```sh
-python -m pip install requests
-python tools/fetch_netease.py 8285082830 --output data/raw.sqlite3
-python tools/prepare.py data/raw.sqlite3 --output data/lyrics.sqlite3
+.venv/bin/python -m pip install requests
 ```
 
-- `tools/fetch_netease.py` 只支持网易云歌单，默认每秒 1 次请求，中断后重跑会继续。
-- `tools/prepare.py` 合并重复版本、清理署名，并按 LRC 时间戳补上每行的起止毫秒数。
-  报告写到同名 `.tsv`，`tools/cleaning_rules.json` 是人工修订规则。
-- 两者都不覆盖已有输出文件。`data/` 已被 `.gitignore` 排除。
+## 准备曲库
 
-曲库结构：
+两个脚本：一个下载原始数据，一个整理成曲库。先有原始数据时可以只跑第二个。
+
+```sh
+# 1. 从网易云歌单下载曲名、署名、歌词与已有译文（默认每秒 1 次请求，可中断续跑）
+.venv/bin/python tools/fetch_netease.py 8285082830 --output data/raw.sqlite3
+
+# 2. 合并重复版本、清理署名，写出带时间戳的曲库
+.venv/bin/python tools/prepare.py data/raw.sqlite3 --output data/lyrics.sqlite3
+```
+
+- `fetch_netease.py` 只支持网易云，接受歌单链接、`#/playlist?id=...` 链接或数字 ID。
+- `prepare.py` 会跳过纯音乐、无歌词和获取失败的曲目，按曲名、署名、原曲引用、
+  歌词指纹和相似度去重，并在同名 `.tsv` 里写出清洗报告。
+  `tools/cleaning_rules.json` 是人工修订规则，`--rules` 可换一份，`[]` 表示不用。
+- 两者都不覆盖已存在的输出文件。
+- 也可以完全不用这两个脚本：任何符合下面表结构的 SQLite 文件都能被读取。
+
+`data/` 已在 `.gitignore` 中排除，曲库文件不会进版本库。
+
+## 曲库结构
 
 ```sql
-songs(id, title, author, duration_ms)
-lyric_lines(id, song_id, position, stanza, text, translation, start_ms, end_ms)
+CREATE TABLE songs (
+    id INTEGER PRIMARY KEY, title TEXT NOT NULL, author TEXT NOT NULL,
+    duration_ms INTEGER
+);
+CREATE TABLE lyric_lines (
+    id INTEGER PRIMARY KEY,
+    song_id INTEGER NOT NULL REFERENCES songs(id),
+    position INTEGER NOT NULL,       -- 曲内行号，从 1 开始
+    stanza INTEGER NOT NULL,         -- 段落编号，按出现顺序不减
+    text TEXT NOT NULL,              -- 原文，回复里显示的就是它
+    translation TEXT,                -- 译文，只参与检索，不会被当成原文返回
+    start_ms INTEGER,                -- 这一行在歌曲中的开始时间
+    end_ms INTEGER,                  -- 这一行在歌曲中的结束时间
+    UNIQUE(song_id, position)
+);
 ```
 
-`translation` 只参与检索，不会被当成原文返回。LRC 只标注开始时间，所以每行的
-`end_ms` 取下一行的开始时间；最后一行取歌曲时长。
+时间以毫秒计，从歌曲开头算起。LRC 只标注开始时间，所以 `prepare.py` 用
+**下一行的开始时间**作为这一行的 `end_ms`，最后一行用 `duration_ms`；
+没有时间戳的行两列都是 `NULL`（本曲库里只有 19 行）。
 
-## 三个入口
+## API
 
 ### `Library(path)`
 
-只读打开曲库，把歌词读进内存，首次检索时建立字符 n-gram TF-IDF 索引。
-曲库在进程内视为快照：重建曲库后需要重新构造 `Library`。
+```python
+Library(db_path, *, max_features=100_000)
+```
 
-### `search(...)`
+只读打开曲库（`mode=ro`），把全部歌词读进内存，首次检索时建立索引。
+曲库在进程内是**快照**：重建曲库后请重新构造 `Library`。支持 `with Library(...) as library:`。
+
+检索索引是**字符 1–3-gram 的 TF-IDF**，每行的文档为
+`normalized(text) + " " + normalized(translation)`，因此中文提问也能命中日文歌词。
+本曲库（4591 首、221484 行）首次建索引约 10–15 秒、约 1 GB 内存，之后每次检索约 0.1–0.2 秒。
+
+### `search()`
 
 ```python
 search(query=None, *, queries=None, author=None, title=None,
@@ -61,114 +140,405 @@ search(query=None, *, queries=None, author=None, title=None,
        exclude=(), refine=None) -> list[Passage]
 ```
 
-从不调用模型。
+纯检索，从不调用模型。
 
-| 参数 | 作用 |
-| --- | --- |
-| `query` | 自由文本，会作为一条检索词 |
-| `queries` | 额外的检索词组，`[["夜道", "夜里散步"], ["街灯"]]`，最多 4 组、每组 3 个词 |
-| `author` / `title` | 按署名、曲名限定，规范化后做子串匹配；没有检索词时返回该范围内的开头片段 |
-| `source` | 从已有片段导航而不是检索，配合 `direction` 使用 |
-| `direction` | `at` 原片段、`before` 前文、`after` 后文、`around` 前后各 `count` 句 |
-| `count` | 导航时扩展的句数 |
-| `limit` | 最多返回几条 |
-| `phrases` | 每条最多合并几小句（默认 4，总长不超过 140 字） |
-| `exclude` | 不要返回的歌词文本，例如上一轮的回复 |
-| `refine` | 可选回调 `refine(options) -> {"choices": [...]}`，用于语义重排，契约与 SELECT 阶段相同 |
+| 参数 | 默认 | 作用 |
+| --- | --- | --- |
+| `query` | `None` | 自由文本，会作为一条检索词 |
+| `queries` | `None` | 额外检索词，`[["夜道", "夜里散步"], ["街灯"]]`，最多 4 组、每组 3 个词 |
+| `author` | `None` | 按署名限定，规范化后做子串匹配 |
+| `title` | `None` | 按曲名限定；有完全同名时优先完全同名 |
+| `source` | `None` | 从已有片段导航，而不是检索；直接用返回的 `passage.to_dict()["source"]` |
+| `direction` | `"after"` | 导航方向：`at` 原片段、`before` 前文、`after` 后文、`around` 前后各 `count` 句 |
+| `count` | `1` | 导航时扩展的句数 |
+| `limit` | `5` | 最多返回几条片段 |
+| `phrases` | `4` | 每条片段最多合并几小句（1–8，总长不超过 140 字） |
+| `exclude` | `()` | 不要返回的歌词文本，例如上一轮的回复 |
+| `refine` | `None` | 可选回调，见[只做一次调用](#只做一次调用refine) |
 
-### `step(history, settings=...)`
+行为细节：
+
+- 没有 `query` / `queries`、但给了 `author` 或 `title` 时，返回这些曲目的开头片段。
+- 检索词会做规范化（全半角、大小写、标点不敏感），少于 2 个字符的词会被丢弃，
+  用户消息本身始终作为一条检索词。
+- 每条候选先取相似度最高的 120 行，命中字面再加 0.18；多个检索组之间轮流取，
+  同一首歌最多 2 行，去重后最多 16 条候选。
+- 候选会向后合并 1–4 小句，但要求同一段落、总长 ≤ 140 字、不与已有小句重复，
+  且不以 `－` `—` `―` 开头。
+
+```python
+library.search("夜里散步")
+library.search(author="いよわ", limit=10)
+library.search(queries=[["夜道", "夜里散步"], ["街灯"]], limit=3)
+library.search(source={"song_id": 12, "start": 4, "end": 4}, direction="after", count=2)
+library.search(source={"song_id": 12, "start": 4, "end": 4}, direction="around", count=1)
+```
+
+### `step()`
 
 ```python
 step(history, *, settings=None) -> list[dict]
 ```
 
-`history` 是 `{"role": "user"|"assistant", "text": str}` 组成的列表，最后一条必须是用户消息。
-返回**新的**列表，原列表不会被修改。助手回复形如：
+`history` 是对话列表，每条为 `{"role": "user"|"assistant", "text": str}`，
+**最后一条必须是用户消息**。返回**新的**列表（原列表不会被修改），末尾追加一条助手回复：
 
-```python
+```jsonc
 {
   "role": "assistant",
   "text": "静かな夜を歩いた\n君の声を聞かせて",
-  "status": "continued",          # continued / selected / no_match / ended
+  "status": "selected",                     // continued / selected / no_match / ended
   "source": {"song_id": 1, "start": 0, "end": 1},
-  "fragments": [
-    {
-      "text": "静かな夜を歩いた\n君の声を聞かせて",
-      "translation": "走过安静的夜\n让我听听你的声音",
-      "title": "夜", "author": "作者甲", "song_id": 1,
-      "position": 1,               # 起始行在曲内的行号
-      "start_ms": 1000, "end_ms": 5000,
-      "source": {"song_id": 1, "start": 0, "end": 1},
-      "lines": [
-        {"position": 1, "text": "静かな夜を歩いた", "translation": "走过安静的夜",
-         "start_ms": 1000, "end_ms": 3000},
-        {"position": 2, "text": "君の声を聞かせて", "translation": "让我听听你的声音",
-         "start_ms": 3000, "end_ms": 5000}
-      ]
-    }
+  "fragments": [ /* Passage.to_dict()，见下文 */ ]
+}
+```
+
+| `status` | 含义 |
+| --- | --- |
+| `continued` | 用户贴的歌词被直接接上，未调用模型 |
+| `selected` | 模型（或确定性排序）从候选里选出了片段 |
+| `no_match` | 没有可用片段，`text` 为空、`fragments` 为空 |
+| `ended` | 已经唱到曲末，`text` 为空、`fragments` 为空 |
+
+助手回复里的 `source` 是最后一段的定位符；把整条助手回复原样放回 `history`，
+下一轮就能从这个位置继续接龙或前后跳转。`source` 视为不透明值，不要自己拼接。
+
+```python
+history = [{"role": "user", "text": "唱点写夜里散步的歌"}]
+history = library.step(history, settings=Settings(model=call_model))
+history = library.step(history + [{"role": "user", "text": "再来几句"}], settings=Settings(model=call_model))
+```
+
+`step` 在以下顺序里做决定：
+
+1. `history` 非空且最后一条是用户消息，否则抛 `ValueError`。
+2. `allow_continue` 允许时，尝试**接龙**：见[接龙行为](#接龙行为)。
+3. 调用 PLAN 生成检索词（`model is None` 时跳过）。
+4. 检索候选；调用 SELECT 挑选（`model is None` 时直接取排序最前的 `results` 条）。
+
+### `Passage` 与 `LineSpan`
+
+`search()` 返回 `Passage`，`step()` 返回的 `fragments` 是 `Passage.to_dict()`。
+
+```python
+@dataclass(frozen=True)
+class Passage:
+    # 字段
+    song_id: int
+    title: str
+    author: str
+    start: int                 # 起始小句序号（不透明）
+    end: int                   # 结束小句序号（不透明，含）
+    text: str                  # 原文，多句用 \n 连接
+    translation: str | None    # 对应译文，多句用 \n 连接；只包含有译文的行，全无则 None
+    lines: tuple[LineSpan, ...]
+
+    # 计算属性
+    position: int              # 起始行在曲内的行号，从 1 开始（= lines[0].position）
+    start_ms: int | None       # 片段开始时间（= 第一行的 start_ms）
+    end_ms: int | None         # 片段结束时间（= 最后一行的 end_ms）
+
+@dataclass(frozen=True)
+class LineSpan:
+    position: int
+    text: str
+    translation: str | None
+    start_ms: int | None
+    end_ms: int | None
+```
+
+`Passage.to_dict()` 的形状：
+
+```json
+{
+  "text": "静かな夜を歩いた\n君の声を聞かせて",
+  "translation": "走过安静的夜\n让我听听你的声音",
+  "title": "夜",
+  "author": "作者甲",
+  "song_id": 1,
+  "position": 1,
+  "start_ms": 1000,
+  "end_ms": 5000,
+  "source": {"song_id": 1, "start": 0, "end": 1},
+  "lines": [
+    {"position": 1, "text": "静かな夜を歩いた", "translation": "走过安静的夜",
+     "start_ms": 1000, "end_ms": 3000},
+    {"position": 2, "text": "君の声を聞かせて", "translation": "让我听听你的声音",
+     "start_ms": 3000, "end_ms": 5000}
   ]
 }
 ```
 
-`source` 是不透明的定位符，原样传回即可继续接龙或前后跳转。
-把助手回复原样放回 `history`，下一轮就能从这句歌词之后接下去。
+注意 `text` 与 `lines` 不是一一对应：小句可能由多行合并而成（日文歌词常在句中换行），
+`lines` 给出的是真正的逐行时间，适合做逐句高亮或滚动。
 
-## 接龙不需要模型
+### `Settings`
 
-如果最新一条用户消息本身就是整句歌词（规范化后与曲库一致、落在短语边界上），
-`step` 直接返回下一句，不调用任何模型。前提是这句歌词在曲库里只有一种后续；
-有歧义时退回模型挑选。用 `Settings(allow_continue=False)` 或自定义判断函数关闭：
+设置随每次调用传入，模块不保存任何东西。
 
 ```python
-Settings(allow_continue=lambda history: False)
+@dataclass(frozen=True)
+class Settings:
+    model: Callable | None = None            # 见下文 call_model
+    plan_temperature: float = 0.2            # PLAN 阶段
+    select_temperature: float = 0.55         # SELECT 阶段
+    results: int = 3                         # 一次回复最多选几段
+    phrases: int = 4                         # 每段最多几小句
+    allow_continue: bool | Callable = True   # 是否允许直接接龙；可传判断函数
 ```
 
-## 两个模型阶段
+`allow_continue` 传函数时接收整个 `history`（已复制），返回真假：
 
-其余情况下 `step` 调用两次 `settings.model`：
+```python
+# 用户问“这句什么意思”时不要接着唱，其余情况允许
+Settings(allow_continue=lambda history: "什么意思" not in history[-1]["text"])
+```
 
-1. **PLAN**：把对话变成检索词，以及用户明确点名的作者/曲名。
-2. **SELECT**：从检索出的候选片段里挑 `{id, count}`，`count` 是连续引用几小句。
+## 接入模型：`call_model`
 
-`settings.model` 的签名与原来一致：
+`step()` 需要模型时调用 `settings.model`，一次用户消息最多两次。
+
+### 签名与返回值
 
 ```python
 def call_model(system: str, prompt: str, temperature: float, schema: dict) -> dict:
     ...
 ```
 
-`system` 是 `botaloid_lite.prompts.PLAN` 或 `SELECT`，`schema` 是给支持结构化输出的
-接口用的 JSON Schema。返回解析后的 `dict`（也接受 JSON 字符串）。抛异常会变成
-`botaloid_lite.ModelError`。
+| 参数 | 内容 |
+| --- | --- |
+| `system` | 系统提示词原文，等于 `botaloid_lite.prompts.PLAN` 或 `prompts.SELECT`，可用来判断阶段 |
+| `prompt` | 已经拼好的用户消息，直接作为 user 消息发送，不需要再加工 |
+| `temperature` | 本阶段建议温度，默认 PLAN 0.2、SELECT 0.55 |
+| `schema` | 本阶段的 JSON Schema，等于 `prompts.PLAN_SCHEMA` 或 `prompts.SELECT_SCHEMA`；支持结构化输出的接口可以直接使用，不支持的忽略即可 |
 
-不传 `model` 时 `step` 完全确定性：直接返回检索排序最靠前的片段。
+返回值：**解析后的 `dict`**。也接受 JSON 字符串（模块会自行 `json.loads`）。
+返回非 dict、或 JSON 解析失败时按 `{}` 处理——不会抛异常，但这一阶段不会选出内容。
 
-```python
-from dataclasses import dataclass
+`prompt` 的形状是固定的，适配器不需要理解它，原样转发即可：
 
-@dataclass(frozen=True)
-class Settings:
-    model: Callable | None = None
-    plan_temperature: float = 0.2
-    select_temperature: float = 0.55
-    results: int = 3          # SELECT 最多选几段
-    phrases: int = 4          # 每段最多几小句
-    allow_continue: bool | Callable[[list[dict]], bool] = True
+```
+前文（只用于参考）：
+用户：……
+机器人：……
+候选歌词：
+候选 1（《曲名》 / 署名）：1) 第一句 / 2) 第二句
+候选 2（《曲名》 / 署名）：1) ……
+【当前用户】
+用户这次说的话
+【当前用户结束】
 ```
 
-设置随调用传入，模块不保存任何东西。
+“候选歌词”只在 SELECT 阶段出现。
 
-## 和 Botaloid 的区别
+### PLAN 阶段
 
-保留：字符 n-gram 检索、译文并入索引、短语边界与软换行合并、候选交错与去重、
-原文重读校验、精确接龙、PLAN/SELECT 两阶段。
+把对话变成检索词，以及用户明确点名的作者 / 曲名。
 
-去掉：15 种语气、5 种意图分类、曲库语言配置、历史引用编号与前后句解析、
-推荐去重、兜底歌词、"这句在讨论还是接龙" 的正则判断（改由 `allow_continue` 决定）、
-设置文件与系统凭据、Web 管理与预览页面。
+```json
+{
+  "queries": [["夜道", "夜里散步"], ["街灯", "路灯"]],
+  "author": "",
+  "title": ""
+}
+```
+
+| 字段 | 要求 | 缺省时 |
+| --- | --- | --- |
+| `queries` | 最多 4 组、每组最多 3 个短词；模块会规范化、去重、丢弃少于 2 字的词 | 只用用户消息本身检索 |
+| `author` | 字符串，最多 100 字符；只在用户点名作者时填 | 不按署名过滤 |
+| `title` | 字符串，最多 100 字符；只在用户点名曲名时填 | 不按曲名过滤 |
+
+`author` / `title` 是**子串匹配**（规范化后），所以写 `いよわ` 能匹配
+`いよわ / 初音ミク`；写成别的写法就匹配不到。
+
+### SELECT 阶段
+
+从候选片段里挑出可以当回复的部分。
+
+```json
+{"choices": [{"id": 2, "count": 1}]}
+```
+
+| 字段 | 要求 |
+| --- | --- |
+| `id` | 候选编号，从 1 开始，必须是整数且落在候选范围内，否则这一项被丢弃 |
+| `count` | 从该候选的第 1 句起连续引用几小句，整数，会夹到 `1..Settings.phrases` |
+
+模块会再做这些校验：同一首歌只取一次、最多取 `Settings.results` 段、
+`choices` 为空或全部无效时这一轮返回 `status: "no_match"`。
+`id` 是候选的顺序编号，不是 `song_id`。
+
+### 容错与错误
+
+- 适配器抛出的任何异常都会被包装成 `botaloid_lite.ModelError` 再抛出（`ModelError` 原样透传），
+  调用方可以用它区分“模型不可用”和“没找到歌词”。
+- 模型返回多出来的字段会被忽略；`choices` 里类型不对的项会被跳过，不会影响其他项。
+- 推理模型会把思考过程算进输出 token。给 `max_tokens` 设太小会让 JSON 被截断，
+  截断后模块按 `{}` 处理，表现为 `no_match`。
+
+### 完整示例：OpenAI 兼容接口
+
+适用于 OpenAI、DeepSeek、LM Studio、llama.cpp、vLLM 等。
+
+```python
+import json
+import requests
+
+from botaloid_lite import Library, ModelError, Settings
+
+def call_model(system, prompt, temperature, schema):
+    body = {
+        "model": "your-model",
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": temperature,
+        "response_format": {"type": "json_object"},
+        "stream": False,
+    }
+    try:
+        response = requests.post(
+            "https://your-endpoint/v1/chat/completions",
+            json=body,
+            headers={"Authorization": "Bearer YOUR_API_KEY"},
+            timeout=(5, 60),
+        )
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+        return json.loads(content)
+    except (requests.RequestException, KeyError, IndexError, ValueError) as error:
+        raise ModelError(str(error)) from error
+
+library = Library("data/lyrics.sqlite3")
+history = library.step([{"role": "user", "text": "想听几首写夜里散步的歌"}],
+                       settings=Settings(model=call_model))
+```
+
+如果接口支持结构化输出，可以在 `body` 里再加 `"response_format": {"type": "json_schema", ...}`，
+或者直接用 `schema` 参数。这个示例用 `json_object` 是因为它兼容性最好。
+
+### 完整示例：Ollama
+
+```python
+import json
+import requests
+
+from botaloid_lite import ModelError, prompts
+
+def call_model(system, prompt, temperature, schema):
+    body = {
+        "model": "qwen3:1.7b",
+        "stream": False,
+        "think": False,                  # 关闭思考，回复更快
+        "format": schema,                # Ollama 原生结构化输出
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        "options": {
+            "temperature": temperature,
+            "num_predict": 320 if system == prompts.PLAN else 220,
+            "num_ctx": 8192,
+        },
+    }
+    try:
+        response = requests.post("http://127.0.0.1:11434/api/chat",
+                                 json=body, timeout=(5, 75))
+        response.raise_for_status()
+        return json.loads(response.json()["message"]["content"])
+    except (requests.RequestException, KeyError, ValueError) as error:
+        raise ModelError(str(error)) from error
+```
+
+### 不接模型
+
+`Settings()` 不传 `model` 时 `step()` 完全确定性：跳过 PLAN，用用户消息直接检索，
+跳过 SELECT，返回排序最靠前的 `results` 条片段。适合离线、测试或自己做重排。
+
+```python
+history = library.step([{"role": "user", "text": "夜里散步"}])
+```
+
+### 只做一次调用：`refine`
+
+如果只想要一次模型调用（不要 PLAN），可以让检索照常进行，再用 `refine` 做语义重排。
+`refine` 收到的参数与 SELECT 阶段的候选完全一样，返回同样的 `{"choices": [...]}`：
+
+```python
+from botaloid_lite import prompts
+
+def render(options):
+    # options: [{"id": 1, "title": "曲名", "author": "署名", "phrases": ["第一句", "第二句"]}]
+    lines = ["候选歌词："]
+    for item in options:
+        phrases = " / ".join(f"{i}) {text}" for i, text in enumerate(item["phrases"], 1))
+        lines.append(f'候选 {item["id"]}（《{item["title"]}》 / {item["author"]}）：{phrases}')
+    return "\n".join(lines)
+
+def refine(options):
+    return call_model(prompts.SELECT, render(options), 0.55, prompts.SELECT_SCHEMA)
+
+passages = library.search("夜里散步", refine=refine, limit=3)
+```
+
+渲染格式由你决定，模块只要求返回 `{"choices": [{"id": ..., "count": ...}]}`。
+也可以跳过模型，把自己的检索词直接交给 `search`：
+
+```python
+passages = library.search(queries=[["夜道", "夜里散步"], ["街灯"]], limit=3)
+```
+
+## 接龙行为
+
+如果最新一条用户消息本身就是**整句歌词**，`step()` 直接返回下一句，不调用任何模型。
+
+判定条件：
+
+1. 规范化后（全半角、大小写、标点、空白不敏感）与曲库中的连续小句完全一致；
+2. 起点和终点都落在小句边界上，即不会截断半句；
+3. 长度至少 2 个字（上一轮回复带有 `source` 时）或 4 个字；
+4. 这句歌词在曲库里出现多次时，**每次后面的那句必须相同**，否则视为有歧义，退回模型挑选。
+
+上一轮回复的 `source` 就停在这句歌词之前时，直接取它后面一句（`status: "continued"`）。
+唱到最后一句时返回 `status: "ended"`。
+
+想关掉接龙，或者只在特定情况下接龙：
+
+```python
+Settings(allow_continue=False)
+Settings(allow_continue=lambda history: "唱" in history[-1]["text"])
+```
+
+注意“用户贴歌词是在接龙还是在讨论这句歌词”属于应用层的判断，模块只按上面的规则执行；
+需要区分时，用 `allow_continue` 传入自己的判断函数。
+
+## 设计要点与限制
+
+- **模型只挑编号，不写歌词。** 两个阶段都只产出检索词和候选编号，歌词永远来自曲库。
+- **译文只参与检索。** 中文提问能命中日文原文，但返回的 `text` 一定是原文，`translation` 单独给出。
+- **短语边界是统一的单位。** 检索、合并、接龙、前后跳转都以小句为最小单位，
+  跨行合并会修复“日文歌词在句中换行”的情况。
+- **曲库是快照。** 构造 `Library` 时读入歌词，重建曲库后要重新构造实例。
+- **只读。** 不会修改曲库文件，也不会写入任何配置。
+- **全量索引在内存里。** 4591 首 / 221484 行约占 1 GB；曲库更大时请调小
+  `Library(path, max_features=...)`，或只保留需要的曲目。
+- **同名歌词去重。** 检索候选按规范化后的行文本去重，所以两首歌里完全相同的句子只会出现一次。
+  译文会一起进入索引，因此一行歌词加上译文后文档更长；两首歌若有完全相同的原文，
+  有译文的那一行得分可能略低于没有译文的那一行。
 
 ## 测试
 
 ```sh
-python -m unittest discover -s tests
+.venv/bin/python -m unittest discover -s tests
 ```
+
+测试覆盖：返回字段与逐行时间、作者 / 曲名过滤、四向导航、`exclude`、`refine`、
+确定性与两阶段的 `step`、接龙与歧义回退、曲末、模型错误包装。
+
+## 数据与版权
+
+歌词和译文的权利归各自权利人所有；本项目的 MIT 许可证不包含对第三方歌词内容的授权。
+采集、导入和后续使用应符合相应授权、平台规则和适用法律。
+`tools/fetch_netease.py` 依赖平台接口，接口和可获取范围可能变化。
