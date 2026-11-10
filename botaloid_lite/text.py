@@ -1,16 +1,16 @@
-"""Normalisation and phrase segmentation.
+"""Normalisation, phrase segmentation and n-gram tokenisation.
 
-The library stores one row per lyric line.  A *phrase* is what a user would
-call "a line to quote": one sentence, or one clause, never a fragment that
-starts mid-word.  Retrieval, quoting and navigation all work on phrases, so
-those boundaries are the unit everything else agrees on.
+A *phrase* is what a user would call "a line to quote": one sentence, or one
+clause, never a fragment that starts mid-word.  Phrases are computed once,
+offline, and stored in the library; everything at query time works on the
+integers that identify them.
+
+This module is pure standard library and is shared by the offline builder and
+the runtime, so the two always tokenise and segment identically.
 """
 
 import re
 import unicodedata
-from collections import defaultdict
-from dataclasses import dataclass
-from functools import cached_property
 
 SENTENCE_END = re.compile(r'[。！？!?]+[」』”’）)]*|(?<![.\d])\.(?=\s|$)')
 CLAUSE_GAP = re.compile(r'(?<=[ぁ-んァ-ヶ])　+')
@@ -18,76 +18,14 @@ ATTACHED_CLAUSE = re.compile(r"^(?:けど|かも|とは|なんて|って|から|
 CLAUSE_END = re.compile(r'(?:ない|たい|だった|です|ます|でしょう|だよ|だね)$')
 OPEN_END = re.compile(r'(?:[、，,:：]|けれど|けど|ながら|そして|なのに|を|[一-龯ァ-ヶ][がのへはに])$')
 WORD_CONTINUES = re.compile(r'^[ぁぃぅぇぉゃゅょっァィゥェォャュョッー]')
+NON_WORD = re.compile(r"[\W_]+")
+
+NGRAM_SIZES = (1, 2, 3)
 
 
 def normalized(text):
     """Matching key: width-, case- and punctuation-insensitive."""
-    return re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", text).casefold())
-
-
-@dataclass(frozen=True)
-class Line:
-    id: int
-    song_id: int
-    position: int
-    stanza: int
-    text: str
-    translation: str | None
-    start_ms: int | None
-    end_ms: int | None
-
-
-@dataclass(frozen=True)
-class Phrase:
-    """One quotable piece of lyric, possibly merged from soft line breaks."""
-
-    text: str
-    lines: tuple[Line, ...]
-
-    @cached_property
-    def key(self):
-        return normalized(self.text)
-
-    @property
-    def start_ms(self):
-        return next((line.start_ms for line in self.lines if line.start_ms is not None), None)
-
-    @property
-    def end_ms(self):
-        return next((line.end_ms for line in reversed(self.lines) if line.end_ms is not None), None)
-
-
-@dataclass(frozen=True)
-class Track:
-    lines: list[Line]
-
-    @cached_property
-    def phrases(self):
-        result = []
-        for line in self.lines:
-            pieces = split_line(line.text)
-            if not pieces:
-                continue
-            if result:
-                previous = result[-1]
-                last = previous.lines[-1]
-                if (last.position + 1 == line.position and last.stanza == line.stanza
-                        and (OPEN_END.search(previous.text) or
-                             (WORD_CONTINUES.match(pieces[0]) and not SENTENCE_END.search(previous.text)))):
-                    # A soft database line break can fall inside one phrase.
-                    separator = " " if previous.text[-1].isascii() or pieces[0][0].isascii() else ""
-                    result[-1] = Phrase(previous.text + separator + pieces[0], (*previous.lines, line))
-                    pieces = pieces[1:]
-            result.extend(Phrase(piece, (line,)) for piece in pieces)
-        return result
-
-    @cached_property
-    def by_line(self):
-        positions = defaultdict(list)
-        for i, phrase in enumerate(self.phrases):
-            for line in phrase.lines:
-                positions[line.id].append(i)
-        return positions
+    return NON_WORD.sub("", unicodedata.normalize("NFKC", str(text)).casefold())
 
 
 def split_line(text):
@@ -110,3 +48,36 @@ def split_line(text):
         elif rest and result:
             result[-1] += rest
     return [piece for piece in result if normalized(piece)]
+
+
+def phrases(rows):
+    """Group lyric rows into phrases.
+
+    `rows` yields ``(position, stanza, text)`` in song order.  Returns
+    ``(line_first, line_last, text, stanza)`` tuples, where the line range is
+    inclusive and 1-based.
+
+    Lines are split into sentences and clauses; then adjacent rows are merged
+    again when the line break falls inside a clause, which is common in
+    Japanese lyrics.
+    """
+    result = []
+    for position, stanza, text in rows:
+        pieces = split_line(text)
+        if not pieces:
+            continue
+        if result:
+            first, last, previous, previous_stanza = result[-1]
+            if (last + 1 == position and previous_stanza == stanza
+                    and (OPEN_END.search(previous) or
+                         (WORD_CONTINUES.match(pieces[0]) and not SENTENCE_END.search(previous)))):
+                separator = " " if previous[-1].isascii() or pieces[0][0].isascii() else ""
+                result[-1] = [first, position, previous + separator + pieces[0], previous_stanza]
+                pieces = pieces[1:]
+        result.extend([position, position, piece, stanza] for piece in pieces)
+    return [tuple(item) for item in result]
+
+
+def ngrams(text, size):
+    """Character n-grams of a normalised string."""
+    return [text[i:i + size] for i in range(len(text) - size + 1)]

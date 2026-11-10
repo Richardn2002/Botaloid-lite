@@ -11,7 +11,7 @@
   不传 `model` 时完全确定性，不调用任何模型。
 - 每条结果都带原文、译文、`start_ms` / `end_ms`、逐行时间、曲名、署名、曲内行号。
 - `botaloid_lite.media` 是独立的可选模块，把歌词元数据换成带起播时间的播放链接（先支持 VocaDB → YouTube），
-  不依赖检索、模型或 numpy。
+  不依赖检索或模型。
 
 ```python
 from botaloid_lite import Library, Settings
@@ -59,7 +59,7 @@ print(history[-1]["fragments"])
 
 ## 安装
 
-需要 Python 3.11+ 和 numpy、scikit-learn。
+需要 Python 3.11+。没有第三方运行时依赖；`pip install -e .` 只是为了把包装进环境。
 
 ```sh
 python -m venv .venv
@@ -90,8 +90,10 @@ Windows 下把 `.venv/bin/python` 换成 `.venv\Scripts\python`。
 - `prepare.py` 会跳过纯音乐、无歌词和获取失败的曲目，按曲名、署名、原曲引用、
   歌词指纹和相似度去重，并在同名 `.tsv` 里写出清洗报告。
   `tools/cleaning_rules.json` 是人工修订规则，`--rules` 可换一份，`[]` 表示不用。
+- `prepare.py` 写完曲库后会顺带构建检索索引（见下节），本曲库约 25 秒、200 MB。
 - 两者都不覆盖已存在的输出文件。
-- 也可以完全不用这两个脚本：任何符合下面表结构的 SQLite 文件都能被读取。
+- 也可以完全不用这两个脚本：任何符合下面表结构的 SQLite 文件都能被读取，再用
+  `python -m botaloid_lite.build data/lyrics.sqlite3` 补建索引。
 
 `data/` 已在 `.gitignore` 中排除，曲库文件不会进版本库。
 
@@ -119,20 +121,51 @@ CREATE TABLE lyric_lines (
 **下一行的开始时间**作为这一行的 `end_ms`，最后一行用 `duration_ms`；
 没有时间戳的行两列都是 `NULL`（本曲库里只有 19 行）。
 
+### 检索索引
+
+索引也放在同一个文件里，由 `prepare.py` 或 `python -m botaloid_lite.build <db>` 生成：
+
+```sql
+CREATE TABLE phrases (
+    id INTEGER PRIMARY KEY, song_id INTEGER NOT NULL, idx INTEGER NOT NULL,
+    stanza INTEGER NOT NULL, line_first INTEGER NOT NULL, line_last INTEGER NOT NULL,
+    text TEXT NOT NULL, translation TEXT, text_key TEXT NOT NULL,
+    start_ms INTEGER, end_ms INTEGER, norm REAL NOT NULL
+);
+CREATE VIRTUAL TABLE lyric_fts USING fts5(
+    u, b, t, content='', tokenize='unicode61'
+);
+CREATE TABLE grams (gram TEXT PRIMARY KEY, df INTEGER NOT NULL);
+```
+
+- `phrases` 是检索单位：小句（必要时合并了句中换行），`line_first`/`line_last`
+  指向它覆盖的 `lyric_lines.position` 范围。`norm` 是构建时算好的向量长度。
+- `lyric_fts` 是 contentless FTS5 表，`rowid` 就是 `phrases.id`；三列分别是
+  单字、双字、三字 n-gram。
+- `grams` 是 n-gram 的文档频率，重排时用来算 idf。
+
+本曲库（4591 首、215988 短语）的索引约 197 MB，构建约 25 秒、峰值内存约 250 MB。
+索引是离线构建的，运行时只读。
+
 ## API
 
 ### `Library(path)`
 
 ```python
-Library(db_path, *, max_features=100_000)
+Library(db_path, *, cache_size=32, pool=40, weights=(1.0, 1.5, 2.0))
 ```
 
-只读打开曲库（`mode=ro`），把全部歌词读进内存，首次检索时建立索引。
-曲库在进程内是**快照**：重建曲库后请重新构造 `Library`。支持 `with Library(...) as library:`。
+只读打开曲库（`mode=ro`）。**索引在磁盘上**，Python 只保留曲目表（本曲库约 2 MB）
+和 SQLite 页缓存，因此内存不随歌词数量增长：本曲库常驻约 35–45 MB。
 
-检索索引是**字符 1–3-gram 的 TF-IDF**，每行的文档为
-`normalized(text) + " " + normalized(translation)`，因此中文提问也能命中日文歌词。
-本曲库（4591 首、221484 行）首次建索引约 10–15 秒、约 1 GB 内存，之后每次检索约 0.1–0.2 秒。
+| 参数 | 作用 |
+| --- | --- |
+| `cache_size` | SQLite 页缓存，单位 MB，默认 32；小机器可以调到 8 |
+| `pool` | 每个检索方向先取多少条 FTS 结果 |
+| `weights` | `bm25` 的单字 / 双字 / 三字列权重 |
+
+曲库在进程内是**快照**：重建曲库或索引后请重新构造 `Library`。
+支持 `with Library(...) as library:`。没有索引的文件会抛 `MissingIndexError`。
 
 ### `search()`
 
@@ -163,8 +196,11 @@ search(query=None, *, queries=None, author=None, title=None,
 - 没有 `query` / `queries`、但给了 `author` 或 `title` 时，返回这些曲目的开头片段。
 - 检索词会做规范化（全半角、大小写、标点不敏感），少于 2 个字符的词会被丢弃，
   用户消息本身始终作为一条检索词。
-- 每条候选先取相似度最高的 120 行，命中字面再加 0.18；多个检索组之间轮流取，
-  同一首歌最多 2 行，去重后最多 16 条候选。
+- 每个检索方向先走 FTS5：词拆成三字、双字 n-gram 做 OR 查询，按 `bm25` 排序；
+  只有结果不足 8 条时才补单字查询，避免常用字把候选撑爆。
+- 召回结果再用 TF-IDF 余弦重排：idf 来自 `grams` 表，文档向量长度在构建时算好；
+  查询词的字面命中再加 0.18。
+- 多个检索组之间轮流取，同一首歌最多 2 条，去重后最多 16 条候选。
 - 候选会向后合并 1–4 小句，但要求同一段落、总长 ≤ 140 字、不与已有小句重复，
   且不以 `－` `—` `―` 开头。
 
@@ -288,7 +324,7 @@ class Settings:
 ## 媒体链接
 
 `botaloid_lite.media` 把一段歌词元数据换成可以播放的链接。它不依赖 `Library`，
-也不依赖 numpy/scikit-learn，只用标准库；`Passage`、`Passage.to_dict()` 或任何带
+只用标准库；`Passage`、`Passage.to_dict()` 或任何带
 `title` / `author` / `start_ms` 的对象都能直接传进去。
 
 ```python
@@ -568,13 +604,12 @@ passages = library.search(queries=[["夜道", "夜里散步"], ["街灯"]], limi
 - **译文只参与检索。** 中文提问能命中日文原文，但返回的 `text` 一定是原文，`translation` 单独给出。
 - **短语边界是统一的单位。** 检索、合并和前后跳转都以小句为最小单位，
   跨行合并会修复“日文歌词在句中换行”的情况。
-- **曲库是快照。** 构造 `Library` 时读入歌词，重建曲库后要重新构造实例。
-- **只读。** 不会修改曲库文件，也不会写入任何配置。
-- **全量索引在内存里。** 4591 首 / 221484 行约占 1 GB；曲库更大时请调小
-  `Library(path, max_features=...)`，或只保留需要的曲目。
-- **同名歌词去重。** 检索候选按规范化后的行文本去重，所以两首歌里完全相同的句子只会出现一次。
-  译文会一起进入索引，因此一行歌词加上译文后文档更长；两首歌若有完全相同的原文，
-  有译文的那一行得分可能略低于没有译文的那一行。
+- **索引在磁盘上。** 4591 首 / 215988 短语的索引约 197 MB，常驻内存约 35–45 MB；
+  曲库变大只影响磁盘和构建时间，不影响每进程内存。
+- **只读。** 运行时不会写入曲库，也不会落任何配置。
+- **同名歌词去重。** 检索候选按规范化后的短语文本去重，两首歌里完全相同的句子只出现一次。
+- **词形召回有上限。** 候选由 n-gram 召回决定，只能命中与查询共享 n-gram 的句子；
+  这一点和 TF-IDF 一样是词面的，不是语义的。
 
 ## 测试
 
@@ -582,9 +617,10 @@ passages = library.search(queries=[["夜道", "夜里散步"], ["街灯"]], limi
 .venv/bin/python -m unittest discover -s tests
 ```
 
-测试覆盖：返回字段与逐行时间、作者 / 曲名过滤、四向导航、`exclude`、`refine`、
-确定性排序与两阶段 `step`、模型错误包装；媒体链接的元数据转换、VocaDB 匹配与
-PV 选择、URL 与时间戳、缓存、provider 选择与失败隔离。
+测试覆盖：索引构建与短语切分、返回字段与逐行时间、作者 / 曲名过滤、四向导航、
+`exclude`、`refine`、确定性排序与两阶段 `step`、模型错误包装、缺失索引报错；
+媒体链接的元数据转换、VocaDB 匹配与 PV 选择、URL 与时间戳、缓存、provider
+选择与失败隔离。
 
 ## 数据与版权
 

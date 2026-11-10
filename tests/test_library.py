@@ -4,8 +4,9 @@ from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from botaloid_lite import Library, ModelError, Settings
+from botaloid_lite import Library, MissingIndexError, ModelError, Settings
 from botaloid_lite import prompts
+from botaloid_lite.build import build_index
 
 SCHEMA = """
 CREATE TABLE songs (id INTEGER PRIMARY KEY, title TEXT NOT NULL, author TEXT NOT NULL,
@@ -44,6 +45,7 @@ def build(path):
                 "VALUES(?,?,?,?,?,?,?)",
                 [(song_id, position, 0, text, translation, start, end)
                  for position, (text, translation, start, end) in enumerate(lyrics, 1)])
+    build_index(path)
 
 
 class LibraryTests(unittest.TestCase):
@@ -128,6 +130,13 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(result[-1]["status"], "selected")
         self.assertEqual(len(result[-1]["fragments"]), 1)
 
+    def test_step_does_not_repeat_the_previous_reply(self):
+        result = self.library.step([
+            {"role": "assistant", "text": "静かな夜を歩いた", "source": None},
+            {"role": "user", "text": "夜を歩いた"},
+        ])
+        self.assertNotIn("静かな夜を歩いた", result[-1]["text"])
+
     def test_step_requires_a_final_user_turn(self):
         with self.assertRaises(ValueError):
             self.library.step([{"role": "assistant", "text": "hello"}])
@@ -137,6 +146,44 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(result[-1]["status"], "selected")
         self.assertTrue(result[-1]["fragments"])
         self.assertTrue(all(fragment["start_ms"] is not None for fragment in result[-1]["fragments"]))
+
+    def test_the_same_title_is_quoted_once(self):
+        folder = TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / "dup.sqlite3"
+        with closing(sqlite3.connect(path)) as db, db:
+            db.executescript(SCHEMA)
+            for author, text in [("a", "ひとつめ"), ("b", "ふたつめ")]:
+                song_id = db.execute("INSERT INTO songs(title,author) VALUES('同名',?)",
+                                     (author,)).lastrowid
+                db.execute("INSERT INTO lyric_lines(song_id,position,stanza,text) "
+                           "VALUES(?,1,0,?)", (song_id, text))
+        build_index(path)
+        with closing(Library(path)) as library:
+            passages = library.search(author="a", refine=lambda options: {
+                "choices": [{"id": 1, "count": 1}, {"id": 2, "count": 1}]})
+        self.assertEqual([passage.author for passage in passages], ["a"])
+
+    def test_missing_index_is_reported(self):
+        folder = TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / "raw.sqlite3"
+        build(path)
+        with sqlite3.connect(path) as db:
+            db.executescript("DROP TABLE phrases; DROP TABLE grams; DROP TABLE lyric_fts;")
+        with self.assertRaises(MissingIndexError):
+            Library(path)
+
+    def test_build_index_stores_phrases_grams_and_norms(self):
+        with sqlite3.connect(self.path) as db:
+            phrases = db.execute("select count(*) from phrases").fetchone()[0]
+            grams = db.execute("select count(*) from grams").fetchone()[0]
+            unset = db.execute("select count(*) from phrases where norm <= 0").fetchone()[0]
+            fts = db.execute("select count(*) from lyric_fts").fetchone()[0]
+        self.assertGreater(phrases, 0)
+        self.assertGreater(grams, 0)
+        self.assertEqual(unset, 0)
+        self.assertEqual(fts, phrases)
 
     def test_model_failures_are_reported(self):
         def model(*_args):

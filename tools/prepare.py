@@ -9,6 +9,7 @@ import csv
 import json
 import re
 import sqlite3
+import sys
 import unicodedata
 from collections import Counter, defaultdict
 from contextlib import closing
@@ -16,6 +17,11 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from statistics import median
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from botaloid_lite.build import build_index  # noqa: E402
 
 STAMP = re.compile(r'\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]')
 LRC_TAG = re.compile(r'^\[(?:ti|ar|al|by|offset|re|ve|length|kana):.*\]$', re.I)
@@ -465,6 +471,9 @@ def main():
           'timed:',sum(start is not None for song in kept for _,_,_,start in song.lines))
     print('kept alternate candidates:',sum(s.alt for s in kept),'missing author:',sum(s.author == '作者未标注' for s in kept))
     write_database(output, kept)
+    indexed = build_index(output)
+    print(f'索引: {indexed["phrases"]} 短语, {indexed["seconds"]:.1f}s, '
+          f'{indexed["bytes"] / 2**20:.0f} MB')
     print('曲库:', output)
     print('报告:', report)
 

@@ -7,40 +7,51 @@ Public surface:
     library.search(source=fragment["source"], direction="after")
     library.step(history, settings=Settings(model=call_model))
 
-`search` never calls a model.  `step` calls the model twice per user turn --
+Retrieval never calls a model.  ``step`` calls the model twice per user turn:
 once to turn the conversation into search terms, once to choose among the
 candidates those terms retrieved.
+
+Everything the runtime needs is in the SQLite file: the phrases, an FTS5 index
+over their unigrams, bigrams and trigrams, document frequencies and the
+precomputed vector lengths.  Python keeps only the song list and SQLite's page
+cache, so memory does not grow with the number of lyrics.
 """
 
 import json
 import sqlite3
 import threading
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from itertools import zip_longest
+from math import log, sqrt
 from pathlib import Path
 
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-
 from .prompts import PLAN, PLAN_SCHEMA, SELECT, SELECT_SCHEMA
-from .text import Line, Track, normalized
+from .text import NGRAM_SIZES, normalized, ngrams
 
 Model = Callable[[str, str, float, dict], Mapping | str]
 DIRECTIONS = ("at", "before", "after", "around")
 MAX_QUERIES = 4
 MAX_TERMS = 3
 MAX_CANDIDATES = 16
-POOL = 120
 MAX_CHARS = 140
 MIN_TERM = 2
 MAX_TERM = 96
 HISTORY_TURNS = 6
 HISTORY_CHARS = 350
+DEFAULT_POOL = 40
+DEFAULT_WEIGHTS = (1.0, 1.5, 2.0)
+FALLBACK_MIN = 8
+SQL_CHUNK = 900
 
 
 class ModelError(Exception):
     """A model call failed.  The library never hides one."""
+
+
+class MissingIndexError(RuntimeError):
+    """The database has no retrieval index; rebuild it first."""
 
 
 @dataclass(frozen=True)
@@ -109,28 +120,41 @@ class Settings:
     phrases: int = 4
 
 
+@dataclass(frozen=True)
+class Candidate:
+    """A scored phrase span, before its line-level metadata is fetched."""
+
+    song_id: int
+    start: int
+    end: int
+    title: str
+    author: str
+    text: str
+    phrases: tuple[str, ...]
+
+
 class Library:
-    def __init__(self, db_path, *, max_features=100_000):
+    def __init__(self, db_path, *, cache_size=32, pool=DEFAULT_POOL,
+                 weights=DEFAULT_WEIGHTS):
         self.path = Path(db_path).resolve()
+        self.pool = max(4, int(pool))
+        self.weights = tuple(float(weight) for weight in weights)
         self._lock = threading.RLock()
-        self._max_features = max_features
-        self._vectorizer = None
-        self._matrix = None
         self._db = sqlite3.connect(self.path.as_uri() + "?mode=ro",
-                                  uri=True, check_same_thread=False)
+                                   uri=True, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
+        self._db.execute(f"PRAGMA cache_size=-{max(1, int(cache_size)) * 1024}")
         with self._lock:
+            names = {row[0] for row in self._db.execute(
+                "SELECT name FROM sqlite_master WHERE name IN ('phrases','lyric_fts','grams')")}
+            if names != {"phrases", "lyric_fts", "grams"}:
+                raise MissingIndexError(
+                    f"{self.path} has no retrieval index; run "
+                    f"`python -m botaloid_lite.build {self.path}` first")
             self._songs = {row["id"]: dict(row) for row in self._db.execute(
                 "SELECT id,title,author,duration_ms FROM songs")}
-            self._lines = [Line(row["id"], row["song_id"], row["position"], row["stanza"],
-                                row["text"], row["translation"], row["start_ms"], row["end_ms"])
-                           for row in self._db.execute(
-                "SELECT id,song_id,position,stanza,text,translation,start_ms,end_ms "
-                "FROM lyric_lines ORDER BY song_id,position")]
-            grouped = {}
-            for line in self._lines:
-                grouped.setdefault(line.song_id, []).append(line)
-            self._tracks = {song_id: Track(group) for song_id, group in grouped.items()}
+            self._phrase_count = self._db.execute(
+                "SELECT count(*) FROM phrases").fetchone()[0]
 
     def close(self):
         self._db.close()
@@ -161,22 +185,28 @@ class Library:
         if source is not None:
             if direction not in DIRECTIONS:
                 raise ValueError("direction must be one of " + ", ".join(DIRECTIONS))
-            return self._navigate(source, direction, count)
-        groups = _groups(queries, query)
-        allowed = _matching(self._songs, author, title)
+            passage = self._navigate(source, direction, count)
+            return [passage] if passage is not None else []
+        allowed = self._matching(author, title)
         if not allowed:
             return []
-        mask = allowed if (author or title) else None
+        filtered = bool(author or title)
+        groups = _groups(queries, query)
         if groups:
-            quotes = self._quotes(self._candidates(groups, exclude, mask), groups, phrases)
-            quotes = [quote for quote in quotes if quote.song_id in allowed]
-        elif author or title:
-            quotes = self._openings(allowed, limit, phrases)
+            candidates = self._retrieve(groups, allowed, filtered,
+                                        {normalized(text) for text in exclude}, phrases)
+        elif filtered:
+            candidates = self._openings(allowed, limit, phrases)
         else:
             return []
         if refine is not None:
-            return self._apply(refine(_options(self._tracks, quotes)), quotes, limit, phrases)
-        return quotes[:limit]
+            chosen = self._apply(refine(_options(candidates)), candidates, limit, phrases)
+            return [passage for passage in
+                    (self._passage(candidate, count) for candidate, count in chosen)
+                    if passage is not None]
+        return [passage for passage in
+                (self._passage(candidate) for candidate in candidates[:limit])
+                if passage is not None]
 
     # -------------------------------------------------------------------- step
 
@@ -193,128 +223,162 @@ class Library:
         if not turns or turns[-1].get("role") != "user":
             raise ValueError("history must end with a user turn")
         message = str(turns[-1].get("text") or "")
+        # Do not answer a follow-up with the lines we just quoted.
+        exclude = {normalized(line) for turn in turns[:-1]
+                   if turn.get("role") == "assistant"
+                   for line in str(turn.get("text") or "").splitlines() if normalized(line)}
         plan = self._plan(turns, message, settings)
-        quotes = self._quotes_for_plan(plan, message, settings)
-        selected = self._select(quotes, turns, message, settings) if quotes else []
-        return turns + [_turn(selected)]
+        candidates = self._quotes_for_plan(plan, message, settings, exclude)
+        chosen = self._select(candidates, turns, message, settings) if candidates else []
+        return turns + [_turn([passage for passage in
+                               (self._passage(candidate, count) for candidate, count in chosen)
+                               if passage is not None])]
 
-    # --------------------------------------------------------------- internals
+    # --------------------------------------------------------------- retrieval
 
-    def _ensure_index(self):
-        if self._vectorizer is not None:
-            return True
-        docs = [normalized(line.text) + " " + normalized(line.translation or "")
-                for line in self._lines]
-        if not any(doc.strip() for doc in docs):
-            return False
-        vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(1, 3),
-                                     dtype=np.float32, max_features=self._max_features)
-        self._vectorizer = vectorizer
-        self._matrix = vectorizer.fit_transform(docs)
-        return True
-
-    def _candidates(self, groups, exclude=(), allowed=None):
-        if not groups or not self._ensure_index():
+    def _fts(self, match, limit):
+        if not match:
             return []
+        unigram, bigram, trigram = self.weights
+        sql = (f"SELECT rowid FROM lyric_fts WHERE lyric_fts MATCH ? "
+               f"ORDER BY bm25(lyric_fts, {unigram}, {bigram}, {trigram}) LIMIT ?")
         with self._lock:
-            vectors = self._vectorizer.transform([term for group in groups for term in group])
-            scores = (vectors @ self._matrix.T).toarray()
-            if allowed is not None:
-                active = np.fromiter((line.song_id in allowed for line in self._lines),
-                                     dtype=bool, count=len(self._lines))
-                scores[:, ~active] = 0
-        excluded = {normalized(text) for text in exclude}
-        take = min(POOL, len(self._lines))
-        pools, offset = [], 0
-        for group in groups:
-            group_scores = scores[offset:offset + len(group)].max(axis=0)
-            offset += len(group)
-            weights = {}
-            for i in np.argpartition(group_scores, -take)[-take:]:
-                if group_scores[i] <= 0:
-                    continue
-                line = self._lines[i]
-                text = normalized(line.text)
-                if not text or text in excluded:
-                    continue
-                weight = float(group_scores[i])
-                if any(term in text for term in group):
-                    weight += 0.18
-                weights[i] = weight
-            pools.append(sorted(weights, key=lambda i: (-weights[i], i)))
-        seen, per_song, chosen = set(), {}, []
-        # Interleave the searches so one direction cannot take every slot.
-        for i in (i for layer in zip_longest(*pools) for i in layer if i is not None):
-            line = self._lines[i]
-            text = normalized(line.text)
-            if text in seen or per_song.get(line.song_id, 0) >= 2:
+            return [row[0] for row in self._db.execute(sql, (match, limit))]
+
+    def _group_ids(self, group):
+        primary, fallback = [], []
+        for term in group:
+            key = normalized(term)
+            if not key:
                 continue
-            seen.add(text)
-            per_song[line.song_id] = per_song.get(line.song_id, 0) + 1
-            chosen.append(line)
-            if len(chosen) >= MAX_CANDIDATES:
-                break
-        return chosen
+            for size in (3, 2):
+                primary.extend(ngrams(key, size))
+            fallback.extend(ngrams(key, 1))
+        ids = self._fts(_match_text(primary), self.pool)
+        # Unigrams are only a safety net: on their own they flood the result
+        # set with common characters.
+        if len(ids) < FALLBACK_MIN:
+            ids.extend(self._fts(_match_text(fallback), self.pool))
+        return list(dict.fromkeys(ids))
 
-    def _quotes(self, lines, groups, phrases):
-        terms = [term for group in groups for term in group]
-        quotes, seen = [], set()
-        for line in lines:
-            track = self._tracks.get(line.song_id)
-            span = self._span(track, line, terms, phrases) if track else None
-            if not span or (line.song_id, span[0]) in seen:
+    def _retrieve(self, groups, allowed, filtered, exclude, phrases):
+        pools = [self._group_ids(group) for group in groups]
+        ids, seen = [], set()
+        for layer in zip_longest(*pools):
+            for rowid in layer:
+                if rowid is not None and rowid not in seen:
+                    seen.add(rowid)
+                    ids.append(rowid)
+        rows = self._rows(ids)
+        candidates, keys, per_song = [], set(), Counter()
+        for rowid in ids:
+            row = rows.get(rowid)
+            if row is None:
                 continue
-            seen.add((line.song_id, span[0]))
-            passage = self._passage(line.song_id, *span)
-            if passage is not None:
-                quotes.append(passage)
-        return quotes
+            if filtered and row["song_id"] not in allowed:
+                continue
+            key = row["text_key"]
+            if not key or key in exclude or key in keys:
+                continue
+            if per_song[row["song_id"]] >= 2:
+                continue
+            keys.add(key)
+            per_song[row["song_id"]] += 1
+            candidates.append(row)
+        scored = self._rank(candidates, [term for group in groups for term in group])
+        scored.sort(key=lambda item: (-item[1], item[0]["id"]))
+        return [self._extend(row, phrases) for row, _ in scored[:MAX_CANDIDATES]]
 
-    def _span(self, track, line, terms, phrases):
-        starts = [i for i in track.by_line.get(line.id, [])
-                  if len(track.phrases[i].text) <= 180]
-        if not starts:
-            return None
-        start = max(starts, key=lambda i: max(
-            (len(term) for term in terms if term in track.phrases[i].key), default=0))
-        first = track.phrases[start]
-        end, length, keys = start, len(first.text), {first.key}
-        for phrase in track.phrases[start + 1:start + phrases]:
-            if (phrase.lines[0].stanza != first.lines[0].stanza
-                    or length + len(phrase.text) > MAX_CHARS
-                    or phrase.key in keys
-                    or phrase.text.lstrip().startswith(("－", "—", "―"))):
+    def _rows(self, ids):
+        rows = {}
+        with self._lock:
+            for chunk in _chunks(ids, SQL_CHUNK):
+                placeholders = ",".join("?" * len(chunk))
+                for row in self._db.execute(
+                        "SELECT id,song_id,idx,stanza,text,translation,text_key,"
+                        "start_ms,end_ms,line_first,line_last,norm "
+                        f"FROM phrases WHERE id IN ({placeholders})", chunk):
+                    rows[row["id"]] = row
+        return rows
+
+    def _idf(self, grams):
+        grams = list(grams)
+        frequencies = {}
+        with self._lock:
+            for chunk in _chunks(grams, SQL_CHUNK):
+                placeholders = ",".join("?" * len(chunk))
+                for gram, df in self._db.execute(
+                        f"SELECT gram, df FROM grams WHERE gram IN ({placeholders})", chunk):
+                    frequencies[gram] = df
+        total = self._phrase_count
+        return {gram: log((1 + total) / (1 + frequencies.get(gram, 1))) + 1 for gram in grams}
+
+    def _rank(self, rows, terms):
+        query = Counter()
+        for term in terms:
+            key = normalized(term)
+            for size in NGRAM_SIZES:
+                query.update(ngrams(key, size))
+        if not query:
+            return []
+        idf = self._idf(query)
+        weighted = {gram: tf * idf[gram] for gram, tf in query.items()}
+        norm_q = sqrt(sum(value * value for value in weighted.values())) or 1.0
+        literal = [term for term in terms if len(term) >= MIN_TERM]
+        scored = []
+        for row in rows:
+            doc = normalized(row["text"]) + normalized(row["translation"] or "")
+            counts = Counter()
+            for size in NGRAM_SIZES:
+                counts.update(ngrams(doc, size))
+            dot = sum(value * counts[gram] * idf[gram]
+                      for gram, value in weighted.items() if gram in counts)
+            norm = row["norm"] or 0.0
+            score = dot / (norm_q * norm) if norm else 0.0
+            if any(term in row["text_key"] for term in literal):
+                score += 0.18
+            scored.append((row, score))
+        return scored
+
+    def _extend(self, row, limit):
+        with self._lock:
+            window = self._db.execute(
+                "SELECT idx,stanza,text,translation,text_key,start_ms,end_ms,"
+                "line_first,line_last FROM phrases WHERE song_id=? AND idx>=? "
+                "ORDER BY idx LIMIT ?", (row["song_id"], row["idx"], limit)).fetchall()
+        span = [window[0]]
+        length, keys = len(window[0]["text"]), {window[0]["text_key"]}
+        for nxt in window[1:]:
+            if (nxt["idx"] != span[-1]["idx"] + 1 or nxt["stanza"] != window[0]["stanza"]
+                    or length + len(nxt["text"]) > MAX_CHARS
+                    or nxt["text_key"] in keys
+                    or nxt["text"].lstrip().startswith(("－", "—", "―"))):
                 break
-            end, length = end + 1, length + len(phrase.text)
-            keys.add(phrase.key)
-        return start, end
-
-    def _passage(self, song_id, start, end):
-        track, song = self._tracks.get(song_id), self._songs.get(song_id)
-        if track is None or song is None:
-            return None
-        chunk = track.phrases[start:end + 1]
-        if not chunk:
-            return None
-        lines = list(dict.fromkeys(line for phrase in chunk for line in phrase.lines))
-        return Passage(
-            song_id=song_id, title=song["title"], author=song["author"],
-            start=start, end=end,
-            text="\n".join(phrase.text for phrase in chunk),
-            translation="\n".join(line.translation for line in lines if line.translation) or None,
-            lines=tuple(LineSpan(line.position, line.text, line.translation,
-                                 line.start_ms, line.end_ms) for line in lines),
-        )
+            span.append(nxt)
+            length += len(nxt["text"])
+            keys.add(nxt["text_key"])
+        song = self._songs[row["song_id"]]
+        return Candidate(
+            song_id=row["song_id"], start=span[0]["idx"], end=span[-1]["idx"],
+            title=song["title"], author=song["author"],
+            text="\n".join(phrase["text"] for phrase in span),
+            phrases=tuple(phrase["text"] for phrase in span))
 
     def _openings(self, allowed, limit, phrases):
         result = []
         for song_id in sorted(allowed):
-            track = self._tracks.get(song_id)
-            if not track or not track.phrases:
+            with self._lock:
+                rows = self._db.execute(
+                    "SELECT idx,text,translation FROM phrases WHERE song_id=? "
+                    "ORDER BY idx LIMIT ?", (song_id, phrases)).fetchall()
+            if not rows:
                 continue
-            passage = self._passage(song_id, 0, min(phrases, len(track.phrases)) - 1)
-            if passage is not None:
-                result.append(passage)
+            song = self._songs[song_id]
+            result.append(Candidate(
+                song_id=song_id, start=rows[0]["idx"], end=rows[-1]["idx"],
+                title=song["title"], author=song["author"],
+                text="\n".join(row["text"] for row in rows),
+                phrases=tuple(row["text"] for row in rows)))
             if len(result) >= limit:
                 break
         return result
@@ -324,11 +388,13 @@ class Library:
             song_id = int(source["song_id"])
             start, end = int(source["start"]), int(source["end"])
         except (KeyError, TypeError, ValueError):
-            return []
-        track = self._tracks.get(song_id)
-        if track is None or not track.phrases:
-            return []
-        count = min(count, 8)
+            return None
+        with self._lock:
+            total = self._db.execute(
+                "SELECT count(*) FROM phrases WHERE song_id=?", (song_id,)).fetchone()[0]
+        if not total:
+            return None
+        count = min(max(1, count), 8)
         if direction == "before":
             first, last = start - count, start - 1
         elif direction == "around":
@@ -337,11 +403,50 @@ class Library:
             first, last = start, end
         else:
             first, last = end + 1, end + count
-        first, last = max(0, first), min(len(track.phrases) - 1, last)
+        first, last = max(0, first), min(total - 1, last)
         if first > last:
-            return []
-        passage = self._passage(song_id, first, last)
-        return [passage] if passage is not None else []
+            return None
+        candidate = Candidate(song_id=song_id, start=first, end=last, title="",
+                              author="", text="", phrases=())
+        return self._passage(candidate)
+
+    def _passage(self, candidate, count=None):
+        end = candidate.end if count is None else min(candidate.end,
+                                                      candidate.start + max(1, count) - 1)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT idx,text,translation,start_ms,end_ms,line_first,line_last "
+                "FROM phrases WHERE song_id=? AND idx BETWEEN ? AND ? ORDER BY idx",
+                (candidate.song_id, candidate.start, end)).fetchall()
+            if not rows:
+                return None
+            lines = self._db.execute(
+                "SELECT position,text,translation,start_ms,end_ms FROM lyric_lines "
+                "WHERE song_id=? AND position BETWEEN ? AND ? ORDER BY position",
+                (candidate.song_id, rows[0]["line_first"], rows[-1]["line_last"])).fetchall()
+        song = self._songs.get(candidate.song_id, {})
+        return Passage(
+            song_id=candidate.song_id,
+            title=song.get("title", candidate.title),
+            author=song.get("author", candidate.author),
+            start=rows[0]["idx"], end=rows[-1]["idx"],
+            text="\n".join(row["text"] for row in rows),
+            translation="\n".join(row["translation"] for row in rows if row["translation"]) or None,
+            lines=tuple(LineSpan(line["position"], line["text"], line["translation"],
+                                 line["start_ms"], line["end_ms"]) for line in lines))
+
+    def _matching(self, author, title):
+        author_key, title_key = normalized(author or ""), normalized(title or "")
+        pool = {song_id for song_id, song in self._songs.items()
+                if (not author_key or author_key in normalized(song["author"]))
+                and (not title_key or title_key in normalized(song["title"]))}
+        if title_key:
+            exact = {song_id for song_id in pool
+                     if normalized(self._songs[song_id]["title"]) == title_key}
+            return exact or pool
+        return pool
+
+    # ------------------------------------------------------------------- model
 
     def _plan(self, turns, message, settings):
         if settings.model is None:
@@ -351,45 +456,45 @@ class Library:
         return {"queries": plan.get("queries") if isinstance(plan.get("queries"), list) else [],
                 "author": _text(plan.get("author")), "title": _text(plan.get("title"))}
 
-    def _quotes_for_plan(self, plan, message, settings):
+    def _quotes_for_plan(self, plan, message, settings, exclude=()):
         groups = _groups(plan.get("queries"), message)
-        allowed = _matching(self._songs, plan.get("author"), plan.get("title"))
+        allowed = self._matching(plan.get("author"), plan.get("title"))
         if not allowed:
             return []
         named = plan.get("author") or plan.get("title")
         if not groups:
-            return self._openings(allowed, settings.results, settings.phrases) if named else []
-        return self._quotes(self._candidates(groups, allowed=allowed if named else None),
-                            groups, settings.phrases)
+            if not named:
+                return []
+            return self._openings(allowed, settings.results, settings.phrases)
+        return self._retrieve(groups, allowed, bool(named), exclude, settings.phrases)
 
-    def _select(self, quotes, turns, message, settings):
+    def _select(self, candidates, turns, message, settings):
         if settings.model is None:
-            return quotes[:settings.results]
-        options = _options(self._tracks, quotes)
-        choices = self._call(SELECT, _candidates_prompt(turns, message, options),
+            return [(candidate, settings.phrases)
+                    for candidate in candidates[:settings.results]]
+        choices = self._call(SELECT, _candidates_prompt(turns, message, _options(candidates)),
                              settings.select_temperature, SELECT_SCHEMA, settings)
-        return self._apply(choices, quotes, settings.results, settings.phrases)
+        return self._apply(choices, candidates, settings.results, settings.phrases)
 
-    def _apply(self, choices, quotes, results, phrases):
+    def _apply(self, choices, candidates, results, phrases):
         if isinstance(choices, Mapping):
             choices = choices.get("choices")
-        result, used = [], set()
+        result, used, titles = [], set(), set()
         for choice in choices if isinstance(choices, list) else []:
             if not isinstance(choice, Mapping):
                 continue
             candidate_id, count = choice.get("id"), choice.get("count", 1)
-            if type(candidate_id) is not int or not 1 <= candidate_id <= len(quotes):
+            if type(candidate_id) is not int or not 1 <= candidate_id <= len(candidates):
                 continue
             if type(count) is not int:
                 continue
-            quote = quotes[candidate_id - 1]
-            if quote.song_id in used:
+            candidate = candidates[candidate_id - 1]
+            title = normalized(candidate.title)
+            if candidate.song_id in used or title in titles:
                 continue
-            end = min(quote.end, quote.start + max(1, min(count, phrases)) - 1)
-            passage = self._passage(quote.song_id, quote.start, end)
-            if passage is not None:
-                result.append(passage)
-                used.add(quote.song_id)
+            result.append((candidate, max(1, min(count, phrases))))
+            used.add(candidate.song_id)
+            titles.add(title)
             if len(result) >= results:
                 break
         return result
@@ -418,6 +523,24 @@ def _text(value):
     return value.strip()[:100] if isinstance(value, str) else ""
 
 
+def _match_text(tokens):
+    unique = list(dict.fromkeys(token for token in tokens if token))
+    if not unique:
+        return ""
+    return " OR ".join('"' + token.replace('"', '""') + '"' for token in unique)
+
+
+def _chunks(items, size):
+    chunk = []
+    for item in items:
+        chunk.append(item)
+        if len(chunk) >= size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
 def _groups(queries, query):
     groups, seen = [], set()
     source = [queries] if isinstance(queries, str) else list(queries or [])
@@ -437,18 +560,6 @@ def _groups(queries, query):
     if raw and raw not in seen:
         groups.append([raw])
     return groups
-
-
-def _matching(songs, author, title):
-    author_key, title_key = normalized(author or ""), normalized(title or "")
-    pool = {song_id for song_id, song in songs.items()
-            if (not author_key or author_key in normalized(song["author"]))
-            and (not title_key or title_key in normalized(song["title"]))}
-    if title_key:
-        exact = {song_id for song_id in pool
-                 if normalized(songs[song_id]["title"]) == title_key}
-        return exact or pool
-    return pool
 
 
 def _history_prompt(turns, message):
@@ -473,14 +584,10 @@ def _candidates_prompt(turns, message, options):
     return "\n".join(lines)
 
 
-def _options(tracks, quotes):
-    result = []
-    for i, quote in enumerate(quotes, 1):
-        track = tracks.get(quote.song_id)
-        chunk = track.phrases[quote.start:quote.end + 1] if track else []
-        result.append({"id": i, "title": quote.title, "author": quote.author,
-                       "phrases": [phrase.text for phrase in chunk] or [quote.text]})
-    return result
+def _options(candidates):
+    return [{"id": i, "title": candidate.title, "author": candidate.author,
+             "phrases": list(candidate.phrases)}
+            for i, candidate in enumerate(candidates, 1)]
 
 
 def _turn(passages):
