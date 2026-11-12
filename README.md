@@ -207,6 +207,8 @@ class Settings:
     select_temperature: float = 0.55
     results: int = 3                         # 一次回复最多选几段
     phrases: int = 4                         # 每段最多几小句
+    plan_prompt: str | None = None           # 替换 PLAN 正文，见「自定义提示词」
+    select_prompt: str | None = None         # 替换 SELECT 正文
 ```
 
 ## 接入模型
@@ -222,10 +224,10 @@ def call_model(system: str, prompt: str, temperature: float, schema: dict) -> di
 
 | 参数 | 内容 |
 | --- | --- |
-| `system` | 系统提示词，等于 `botaloid_lite.prompts.PLAN` 或 `prompts.SELECT`，可用来判断阶段 |
+| `system` | 系统提示词；未自定义时等于 `prompts.PLAN` 或 `prompts.SELECT`，自定义后为「正文 + 固定输出格式」 |
 | `prompt` | 已经拼好的用户消息，原样作为 user 消息发送 |
 | `temperature` | 本阶段建议温度 |
-| `schema` | 本阶段的 JSON Schema，等于 `prompts.PLAN_SCHEMA` 或 `prompts.SELECT_SCHEMA` |
+| `schema` | 本阶段的 JSON Schema，等于 `prompts.PLAN_SCHEMA` 或 `prompts.SELECT_SCHEMA`（固定，不可自定义） |
 
 返回**解析后的 `dict`**，也接受 JSON 字符串（模块会自行 `json.loads`）。返回非 dict 或解析失败时按 `{}` 处理，这一阶段按空结果继续。
 
@@ -276,6 +278,23 @@ def call_model(system: str, prompt: str, temperature: float, schema: dict) -> di
 | `count` | 从该候选第 1 句起连续引用几小句，整数，会夹到 `1..Settings.phrases` |
 
 同一首歌只取一次、同一个曲名最多出现一次、最多取 `Settings.results` 段；`choices` 为空或全部无效时这一轮返回 `status: "no_match"`。`id` 是候选编号，不是 `song_id`。
+
+### 自定义提示词
+
+两个阶段的系统提示词都由「可替换的正文 + 固定的输出格式块」组成。`Settings.plan_prompt` / `Settings.select_prompt` 替换正文；输出格式块和 JSON Schema 由模块追加，用来保证回复仍能解析。
+
+```python
+settings = Settings(
+    model=call_model,
+    plan_prompt="你是歌词检索助手。把用户的话转成 2 到 4 组日语检索词。",
+    select_prompt="从候选里挑出最像朋友会接的一句话。",
+)
+```
+
+- `None`（默认）使用 `prompts.PLAN_BODY` / `prompts.SELECT_BODY`。
+- 传空字符串时只发送固定的输出格式块。
+- 正文里可以写自己的风格和例子；`queries`、`choices` 的结构以输出格式块为准。
+- 未自定义时 `system` 等于 `prompts.PLAN` / `prompts.SELECT`；自定义后可用 `schema is prompts.PLAN_SCHEMA` 判断阶段。
 
 ### 容错与错误
 
@@ -337,7 +356,7 @@ def call_model(system, prompt, temperature, schema):
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": prompt}],
         "options": {"temperature": temperature,
-                    "num_predict": 320 if system == prompts.PLAN else 220,
+                    "num_predict": 320 if schema is prompts.PLAN_SCHEMA else 220,
                     "num_ctx": 8192},
     }
     try:

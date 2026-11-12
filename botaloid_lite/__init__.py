@@ -1,6 +1,6 @@
 """Botaloid-lite: reply with real lyrics, plus translation, time and credits."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = ["Library", "LineSpan", "MissingIndexError", "ModelError", "Passage", "Settings"]
 

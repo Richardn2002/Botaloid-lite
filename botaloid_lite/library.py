@@ -27,7 +27,8 @@ from itertools import zip_longest
 from math import log, sqrt
 from pathlib import Path
 
-from .prompts import PLAN, PLAN_SCHEMA, SELECT, SELECT_SCHEMA
+from .prompts import (PLAN_BODY, PLAN_FORMAT, PLAN_SCHEMA, SELECT_BODY,
+                      SELECT_FORMAT, SELECT_SCHEMA)
 from .text import NGRAM_SIZES, normalized, ngrams
 
 Model = Callable[[str, str, float, dict], Mapping | str]
@@ -118,6 +119,10 @@ class Settings:
     select_temperature: float = 0.55
     results: int = 3
     phrases: int = 4
+    # Replace the tunable part of each system prompt.  The fixed output-format
+    # block and the JSON schema are always appended by the library.
+    plan_prompt: str | None = None
+    select_prompt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -451,7 +456,8 @@ class Library:
     def _plan(self, turns, message, settings):
         if settings.model is None:
             return {}
-        plan = self._call(PLAN, _history_prompt(turns, message),
+        system = _system_prompt(settings.plan_prompt, PLAN_BODY, PLAN_FORMAT)
+        plan = self._call(system, _history_prompt(turns, message),
                           settings.plan_temperature, PLAN_SCHEMA, settings)
         return {"queries": plan.get("queries") if isinstance(plan.get("queries"), list) else [],
                 "author": _text(plan.get("author")), "title": _text(plan.get("title"))}
@@ -472,7 +478,8 @@ class Library:
         if settings.model is None:
             return [(candidate, settings.phrases)
                     for candidate in candidates[:settings.results]]
-        choices = self._call(SELECT, _candidates_prompt(turns, message, _options(candidates)),
+        system = _system_prompt(settings.select_prompt, SELECT_BODY, SELECT_FORMAT)
+        choices = self._call(system, _candidates_prompt(turns, message, _options(candidates)),
                              settings.select_temperature, SELECT_SCHEMA, settings)
         return self._apply(choices, candidates, settings.results, settings.phrases)
 
@@ -521,6 +528,15 @@ def _clamp(value, low, high):
 
 def _text(value):
     return value.strip()[:100] if isinstance(value, str) else ""
+
+
+def _system_prompt(custom, body, format_block):
+    if custom is None:
+        return body + "\n\n" + format_block
+    if not isinstance(custom, str):
+        raise ValueError("custom prompts must be strings or None")
+    custom = custom.strip()
+    return format_block if not custom else custom + "\n\n" + format_block
 
 
 def _match_text(tokens):

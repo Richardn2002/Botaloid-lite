@@ -137,6 +137,55 @@ class LibraryTests(unittest.TestCase):
         ])
         self.assertNotIn("静かな夜を歩いた", result[-1]["text"])
 
+    def test_default_prompts_are_the_builtin_ones(self):
+        called = []
+
+        def model(system, prompt, temperature, schema):
+            called.append(system)
+            if schema is prompts.PLAN_SCHEMA:
+                return {"queries": [["夜"]], "author": "", "title": ""}
+            return {"choices": [{"id": 1, "count": 1}]}
+
+        self.library.step([{"role": "user", "text": "夜"}], settings=Settings(model=model))
+        self.assertEqual(called, [prompts.PLAN, prompts.SELECT])
+
+    def test_prompts_can_be_customized(self):
+        seen = []
+
+        def model(system, prompt, temperature, schema):
+            seen.append((system, schema))
+            if schema is prompts.PLAN_SCHEMA:
+                return {"queries": [["夜"]], "author": "", "title": ""}
+            return {"choices": [{"id": 1, "count": 1}]}
+
+        settings = Settings(model=model, plan_prompt="自定义规划正文",
+                            select_prompt="自定义选句正文")
+        self.library.step([{"role": "user", "text": "夜"}], settings=settings)
+        plan_system, plan_schema = seen[0]
+        select_system, select_schema = seen[1]
+        self.assertEqual(plan_system, "自定义规划正文\n\n" + prompts.PLAN_FORMAT)
+        self.assertIs(plan_schema, prompts.PLAN_SCHEMA)
+        self.assertEqual(select_system, "自定义选句正文\n\n" + prompts.SELECT_FORMAT)
+        self.assertIs(select_schema, prompts.SELECT_SCHEMA)
+
+    def test_empty_custom_prompt_leaves_only_the_format_block(self):
+        seen = []
+
+        def model(system, prompt, temperature, schema):
+            seen.append(system)
+            if schema is prompts.PLAN_SCHEMA:
+                return {"queries": [["夜"]], "author": "", "title": ""}
+            return {"choices": [{"id": 1, "count": 1}]}
+
+        self.library.step([{"role": "user", "text": "夜"}],
+                          settings=Settings(model=model, plan_prompt="  "))
+        self.assertEqual(seen[0], prompts.PLAN_FORMAT)
+
+    def test_custom_prompt_must_be_a_string(self):
+        with self.assertRaises(ValueError):
+            self.library.step([{"role": "user", "text": "夜"}],
+                              settings=Settings(model=lambda *args: {}, plan_prompt=1))
+
     def test_step_requires_a_final_user_turn(self):
         with self.assertRaises(ValueError):
             self.library.step([{"role": "assistant", "text": "hello"}])
